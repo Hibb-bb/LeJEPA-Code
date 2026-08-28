@@ -290,12 +290,24 @@ def train_once(args, lamb, data_dir, sweep_mode=False):
         name="witness_emb", target="embedding",
         queue_length=2048, target_shape=model.embed_dim,
     )
+    if args.wandb:
+        from lightning.pytorch.loggers import WandbLogger
+
+        logger = WandbLogger(
+            project=args.wandb,
+            name=f"lejepa-mup-w{args.width}-d{args.proj_dim}"
+                 f"-B{args.batch_size}-lam{lamb:.4g}",
+        )
+    else:
+        # Default logger for single runs; none during a sweep (an
+        # N-candidate sweep should not scatter N anonymous log dirs).
+        logger = not sweep_mode
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         devices=args.devices,
         num_sanity_val_steps=0,
         enable_checkpointing=not sweep_mode,
-        logger=not sweep_mode,
+        logger=logger,
         callbacks=[
             spt.callbacks.OnlineProbe(
                 module,
@@ -356,6 +368,12 @@ def main():
     ap.add_argument("--devices", type=int, default=1,
                     help="GPUs; the sweep requires 1 (witness history is "
                          "rank-0-local and DDP re-executes the script)")
+    ap.add_argument("--wandb", type=str, default=None,
+                    help="wandb project name; enables WandbLogger (also "
+                         "during --sweep-lamb: one named run per candidate, "
+                         "so witness trajectories are inspectable). All "
+                         "witness/probe/loss metrics flow to the logger via "
+                         "pl_module.log.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--num-workers", type=int, default=16)
     args = ap.parse_args()
