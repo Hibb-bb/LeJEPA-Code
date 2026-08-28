@@ -184,6 +184,13 @@ class LeJEPA(Module):
     :param n_points: EP quadrature nodes (default: 17)
     :param lamb: SIGReg weight λ (default: 0.02)
     :param pretrained: Load pretrained timm weights
+    :param encoder_kwargs: Extra keyword arguments forwarded to
+        ``timm.create_model`` (e.g. ``embed_dim``, ``depth``, ``num_heads``,
+        ``img_size`` to override a named config for width-ladder
+        experiments). Keys this constructor already passes
+        (``num_classes``, ``drop_path_rate``, ``dynamic_img_size`` for
+        ViTs) raise a ``TypeError`` from timm; a typo of a LeJEPA kwarg
+        also surfaces from the timm model constructor, not this signature
 
     Example::
 
@@ -235,6 +242,7 @@ class LeJEPA(Module):
         lamb: float = 0.02,
         pretrained: bool = False,
         drop_path_rate: float = 0.1,
+        **encoder_kwargs,
     ):
         super().__init__()
 
@@ -244,6 +252,10 @@ class LeJEPA(Module):
             num_classes=0,
             **({"dynamic_img_size": True} if "vit" in encoder_name else {}),
             drop_path_rate=drop_path_rate,
+            # Forwarded to the timm model constructor — lets callers override
+            # architecture hyperparameters on a named config, e.g.
+            # embed_dim/depth/num_heads for width-ladder experiments.
+            **encoder_kwargs,
         )
 
         embed_dim = self.backbone.embed_dim

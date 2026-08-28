@@ -156,6 +156,11 @@ class WitnessCallback(Callback):
         self.verbose = resolve_verbose(verbose)
 
         self._target_queue = None
+        #: Per-computation record of the witness metrics (rank 0 only), one
+        #: dict per validation pass with the epoch added under ``"epoch"``.
+        #: Consumed programmatically, e.g. by
+        #: :mod:`stable_pretraining.lambda_sweep`.
+        self.history: list = []
 
     @property
     def state_key(self) -> str:
@@ -208,6 +213,7 @@ class WitnessCallback(Callback):
         if trainer.global_rank == 0:
             with torch.no_grad():
                 metrics = compute_witnesses(embeddings, self.sigma2, self.band)
+                self.history.append({**metrics, "epoch": trainer.current_epoch})
 
                 for key in ("tr", "lmin", "lmax", "reff", "rfrac", "healthy"):
                     pl_module.log(f"{self.name}/{key}", metrics[key])
