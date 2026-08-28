@@ -1280,3 +1280,15 @@ reproduction commands:
 | iGPT (AIM-style) | autoregressive              | 18.8% | 12.8% |
 
 \* = run still climbing at time of writing.
+
+
+
+ghx4-interactive
+
+srun --account=bfrf-dtai-gh \
+     --partition=ghx4-interactive \
+     --gres=gpu:1 \
+     --cpus-per-task=8 \
+     --mem=32G \
+     --time=01:00:00 \
+     --pty bash

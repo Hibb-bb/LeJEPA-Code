@@ -215,7 +215,7 @@ def build_data(args, data_dir):
         train=torch.utils.data.DataLoader(
             dataset=spt.data.HFDataset(
                 "frgfm/imagenette", split="train",
-                revision="refs/convert/parquet", cache_dir=data_dir,
+                cache_dir=data_dir,
                 transform=train_transform,
             ),
             batch_size=args.batch_size, num_workers=args.num_workers,
@@ -224,7 +224,7 @@ def build_data(args, data_dir):
         val=torch.utils.data.DataLoader(
             dataset=spt.data.HFDataset(
                 "frgfm/imagenette", split="validation",
-                revision="refs/convert/parquet", cache_dir=data_dir,
+                cache_dir=data_dir,
                 transform=val_transform,
             ),
             batch_size=256, num_workers=args.num_workers,
@@ -330,7 +330,7 @@ def main():
     ap.add_argument("--lamb-ref", type=float, default=0.02,
                     help="additive lambda tuned at the REFERENCE rung; "
                          "rescaled here by the master rule")
-    ap.add_argument("--sweep-lamb", type=str, default=None,
+    ap.add_argument("--sweep-lamb", type=str, default='0.005,0.02,0.08,0.3',
                     help="comma-separated lambda grid, e.g. "
                          "'0.005,0.02,0.08,0.3'. Runs the Step-0 sweep AT "
                          "THIS config (values are raw additive lambdas here, "
@@ -345,7 +345,7 @@ def main():
                     help="per run; for --sweep-lamb keep it long enough "
                          "that the witnesses equilibrate (the certifier "
                          "rejects drifting rows as unstable)")
-    ap.add_argument("--n-slices", type=int, default=1024,
+    ap.add_argument("--n-slices", type=int, default=64,
                     help="M; keep FIXED between Step 0 and the ladder")
     ap.add_argument("--ref-width", type=int, default=REF_WIDTH,
                     help="reference-rung width the anchor was tuned at")
