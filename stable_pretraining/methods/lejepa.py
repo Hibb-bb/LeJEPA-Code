@@ -15,10 +15,10 @@ Example::
 
     model = LeJEPA("vit_small_patch16_224")
 
-    global_images = [torch.randn(4, 3, 224, 224)] * 2
-    all_images = [torch.randn(4, 3, 224, 224)] * 6
+    global_views = [torch.randn(4, 3, 224, 224)] * 2
+    local_views = [torch.randn(4, 3, 96, 96)] * 4
     model.train()
-    output = model(global_images, all_images)
+    output = model(global_views=global_views, local_views=local_views)
     output.loss.backward()
 
     model.eval()
@@ -69,18 +69,25 @@ class EppsPulley(nn.Module):
         self.register_buffer("weights", weights * phi)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """:param x: Samples [N, S] (N samples, S slices).
+        """:param x: Samples [..., N, S] (N samples, S slices).  Leading
+            dimensions (e.g. a view axis) are carried through, each treated
+            as an independent batch of N samples.
 
-        :return: Per-slice statistic [S].
+        :return: Per-slice statistic [..., S].
         """
-        N = x.size(0)
+        N = x.size(-2)
         x_t = x.unsqueeze(-1) * self.t
-        cos_mean = x_t.cos().mean(0)
-        sin_mean = x_t.sin().mean(0)
+        cos_mean = x_t.cos().mean(-3)
+        sin_mean = x_t.sin().mean(-3)
 
         if self._is_ddp:
-            all_reduce(cos_mean, op=torch.distributed.ReduceOp.AVG)
-            all_reduce(sin_mean, op=torch.distributed.ReduceOp.AVG)
+            # torch.distributed.nn.all_reduce clones before reducing and
+            # returns the reduced tensor — the returns MUST be assigned, or
+            # each rank silently keeps its purely local means. AVG weights
+            # ranks equally, so equal per-rank N is assumed (the standard
+            # DistributedSampler configuration).
+            cos_mean = all_reduce(cos_mean, op=torch.distributed.ReduceOp.AVG)
+            sin_mean = all_reduce(sin_mean, op=torch.distributed.ReduceOp.AVG)
 
         err = (cos_mean - self.phi).square() + sin_mean.square()
         return (err @ self.weights) * N * self.world_size
@@ -90,8 +97,11 @@ class SlicedEppsPulley(nn.Module):
     """Sliced Epps-Pulley goodness-of-fit test for multivariate normality.
 
     Projects data onto random 1-D directions and averages the univariate
-    Epps-Pulley statistics.  A synchronised step counter seeds the random
-    projections so all DDP ranks sample identical directions.
+    Epps-Pulley statistics.  For multi-view input ``[V, N, D]`` the statistic
+    is computed per view over the N batch samples and averaged over views
+    (and slices) — views are never pooled into a single sample set.  A
+    synchronised step counter seeds the random projections so all DDP ranks
+    sample identical directions.
 
     :param num_slices: Number of random 1-D projections.
     :param t_max: EP integration upper bound.
@@ -108,9 +118,9 @@ class SlicedEppsPulley(nn.Module):
         self.register_buffer("global_step", torch.zeros((), dtype=torch.long))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """:param x: Embeddings [N, D].
+        """:param x: Embeddings [N, D] or [V, N, D] (V views).
 
-        :return: Scalar mean EP statistic.
+        :return: Scalar EP statistic, averaged over slices (and views).
         """
         with torch.no_grad():
             step = self.global_step.clone()
@@ -136,15 +146,20 @@ class LeJEPAOutput(ModelOutput):
     """Output from LeJEPA forward pass.
 
     :ivar loss: Combined invariance + SIGReg loss (0 in eval mode).
-    :ivar embedding: Backbone embeddings [V*N, D] (train) or [N, D] (eval).
+    :ivar embedding: Backbone embeddings of the global views
+        [n_global*N, D] (train) or [N, D] (eval).
     :ivar inv_loss: Invariance component.
     :ivar sigreg_loss: Epps-Pulley goodness-of-fit component.
+    :ivar projection: Detached projector outputs for monitoring:
+        global-view projections flattened to [n_global*N, K] (train) or
+        projected embeddings [N, K] (eval).
     """
 
     loss: torch.Tensor = None
     embedding: torch.Tensor = None
     inv_loss: torch.Tensor = None
     sigreg_loss: torch.Tensor = None
+    projection: torch.Tensor = None
 
 
 class LeJEPA(Module):
@@ -158,7 +173,8 @@ class LeJEPA(Module):
     Centers are computed from global-view projections only.  The invariance
     term penalises the MSE between each view's projection and the center.
     The SIGReg term is a sliced goodness-of-fit test that pushes
-    projected embeddings toward an isotropic Gaussian, averaged over views.
+    projected embeddings toward an isotropic Gaussian; the statistic is
+    computed per view over the batch and averaged over views.
 
     :param encoder_name: timm model name (e.g., ``"vit_base_patch16_224"``)
     :param projector: Optional projection head.  When ``None``, a 3-layer
@@ -173,11 +189,12 @@ class LeJEPA(Module):
 
         model = LeJEPA("vit_base_patch16_224")
         images = torch.randn(4, 3, 224, 224)
+        local_images = torch.randn(4, 3, 96, 96)
 
         model.train()
         output = model(
             global_views=[images, images],
-            all_views=[images, images, images, images],
+            local_views=[local_images] * 4,
         )
         output.loss.backward()
 
@@ -198,7 +215,9 @@ class LeJEPA(Module):
 
             def training_step(self, batch, batch_idx):
                 views = [v["image"] for v in batch["views"]]
-                output = self.model(global_views=views, all_views=views)
+                output = self.model(
+                    global_views=views[:2], local_views=views[2:]
+                )
                 self.log("loss", output.loss)
                 return output.loss
 
@@ -268,7 +287,10 @@ class LeJEPA(Module):
         centers = all_projected[:n_global].mean(0)  # [N, K]
         inv_loss = (centers.unsqueeze(0) - all_projected).square().mean()
 
-        sigreg_loss = sigreg(all_projected.reshape(-1, all_projected.size(-1)))
+        # Per-view statistic over the N batch samples, averaged over views —
+        # pooling views into one sample set would test the view mixture and
+        # inflate the effective sample count by V.
+        sigreg_loss = sigreg(all_projected)
 
         loss = inv_loss + lamb * sigreg_loss
         return loss, inv_loss, sigreg_loss
@@ -299,19 +321,28 @@ class LeJEPA(Module):
             )
 
             embedding = g_features.detach()
+            n_global = len(global_views)
+            projection = (
+                all_projected[:n_global]
+                .reshape(-1, all_projected.size(-1))
+                .detach()
+            )
             return LeJEPAOutput(
                 loss=loss,
                 embedding=embedding,
                 inv_loss=inv_loss,
                 sigreg_loss=sigreg_loss,
+                projection=projection,
             )
         else:
             assert images is not None, "images must be provided in eval mode"
             embedding = self.backbone(images)
+            projection = self.projector(embedding).detach()
             zero = torch.tensor(0.0, device=images.device)
             return LeJEPAOutput(
                 loss=zero,
                 embedding=embedding,
                 inv_loss=zero,
                 sigreg_loss=zero,
+                projection=projection,
             )

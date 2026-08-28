@@ -130,7 +130,13 @@ def create_optimizer(
             exclude_bias_norm is True and named_params is provided.
         optimizer_config: Can be:
             - str: optimizer name from torch.optim or stable_pretraining.optim (e.g., "AdamW", "LARS")
-            - dict: {"type": "AdamW", "lr": 1e-3, "exclude_bias_norm": True, ...}
+            - dict: {"type": "AdamW", "lr": 1e-3, "exclude_bias_norm": True, ...}.
+              A dict may also carry pre-built parameter groups under a
+              ``"params"`` key (e.g., from
+              :func:`stable_pretraining.optim.mup_param_groups`); they
+              replace the ``params`` argument, and ``exclude_bias_norm``
+              splitting is skipped since each group already sets its own
+              ``weight_decay``.
             - partial: pre-configured optimizer factory
             - class: optimizer class (e.g., torch.optim.AdamW)
         named_params: Optional iterable of (name, parameter) tuples. Required when
@@ -194,11 +200,27 @@ def create_optimizer(
             config_copy = optimizer_config.copy()
         opt_type = config_copy.pop("type", "AdamW")
         exclude_bias_norm = config_copy.pop("exclude_bias_norm", _NOT_SET)
+        # Pre-built parameter groups (e.g. from ``mup_param_groups``) carried
+        # in the config override the caller-supplied ``params``.
+        params_override = config_copy.pop("params", None)
         kwargs = config_copy
     else:
         opt_type = optimizer_config
         exclude_bias_norm = _NOT_SET
+        params_override = None
         kwargs = {}
+
+    if params_override is not None:
+        if exclude_bias_norm is not _NOT_SET and exclude_bias_norm:
+            logging.warning(
+                "Optimizer config carries pre-built 'params' groups; ignoring "
+                "exclude_bias_norm=True (groups already set their weight_decay)."
+            )
+        exclude_bias_norm = False
+        params = params_override
+        logging.info(
+            f"Using {len(params)} pre-built parameter groups from optimizer config."
+        )
 
     # Fall back to the global default if the call-site didn't set it (#368).
     if exclude_bias_norm is _NOT_SET:

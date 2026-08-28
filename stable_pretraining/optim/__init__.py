@@ -7,6 +7,10 @@ from .lr_scheduler import (
     LinearWarmupThreeStepsAnnealing,
     create_scheduler,
 )
+from .mup import (
+    apply_mup,
+    mup_param_groups,
+)
 from .utils import (
     create_optimizer,
     is_bias_or_norm_param,
@@ -15,6 +19,8 @@ from .utils import (
 
 __all__ = [
     LARS,
+    apply_mup,
+    mup_param_groups,
     CosineDecayer,
     LinearWarmup,
     LinearWarmupCosineAnnealing,
