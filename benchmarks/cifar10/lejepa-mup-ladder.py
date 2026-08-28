@@ -256,8 +256,12 @@ def train_once(args, lamb, data_dir, sweep_mode=False):
                 "type": "LinearWarmupCosineAnnealing",
                 # Absolute step counts, sharded by device count (a fraction
                 # is misread as an absolute step when epochs <= 10).
-                "peak_step": min(10, max(1, args.epochs // 10))
-                * (len(data.train) // args.devices),
+                "peak_step": min(
+                    min(10, max(1, args.epochs // 10))
+                    * (len(data.train) // args.devices),
+                    # cosine phase needs T_max >= 1 (guards --epochs 1)
+                    (len(data.train) // args.devices) * args.epochs - 1,
+                ),
                 "start_factor": 0.01,
                 "end_lr": args.base_lr / 1000,
                 "total_steps": (len(data.train) // args.devices) * args.epochs,

@@ -269,8 +269,12 @@ def train_once(args, lamb, data_dir, sweep_mode=False):
                 # here would be misread as an absolute step when
                 # 10/epochs >= 1 (epochs <= 10), silently collapsing warmup
                 # to one step on exactly the short runs a sweep uses.
-                "peak_step": min(10, max(1, args.epochs // 10))
-                * (len(data.train) // args.devices),
+                "peak_step": min(
+                    min(10, max(1, args.epochs // 10))
+                    * (len(data.train) // args.devices),
+                    # cosine phase needs T_max >= 1 (guards --epochs 1)
+                    (len(data.train) // args.devices) * args.epochs - 1,
+                ),
                 "start_factor": 0.01,
                 "end_lr": args.base_lr / 1000,
                 "total_steps": (len(data.train) // args.devices) * args.epochs,
