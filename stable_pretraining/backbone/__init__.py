@@ -71,6 +71,15 @@ from .vit import (
     vit_intern6b_patch14_448,
 )
 
+from .romae import (
+    LSST_BAND_WAVELENGTHS,
+    NDPRope,
+    RoMAEForPreTraining,
+    RoMAEForClassification,
+    Encoder as RoMAEEncoder,
+    tokenize_lightcurves,
+)
+
 from .aggregator import TensorAggregator
 from .decoders import CNNImageDecoder, ViTImageDecoder, build_image_decoder
 from . import video  # noqa: F401  — video encoders live under sp.backbone.video.*
@@ -142,4 +151,10 @@ __all__ = [
     CNNImageDecoder,
     ViTImageDecoder,
     build_image_decoder,
+    LSST_BAND_WAVELENGTHS,
+    NDPRope,
+    RoMAEForPreTraining,
+    RoMAEForClassification,
+    RoMAEEncoder,
+    tokenize_lightcurves,
 ]
