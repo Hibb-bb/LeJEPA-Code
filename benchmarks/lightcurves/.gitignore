@@ -1,0 +1,7 @@
+# run outputs: wandb cache, checkpoints, embeddings, UMAPs
+runs/
+# SLURM stdout/stderr
+logs/
+# staged for deletion (rm -rf when sure)
+_trash/
+__pycache__/
