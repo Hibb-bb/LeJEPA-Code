@@ -2,7 +2,7 @@
 
 ```
 lightcurves/
-├── lejepa-mup-ladder.py   main experiment: mu-P width ladder + LeJEPA / supervised pretraining
+├── pretrain.py            main experiment: mu-P width ladder + LeJEPA / supervised pretraining
 ├── downstream.py          frozen-encoder eval (classification + period regression, transfer matrix)
 ├── jobs/                  SLURM scripts; submit from anywhere:  sbatch jobs/<name>.slurm
 │   ├── cross-survey.slurm         1 GPU, array 0 = lejepa, 1 = supervised, then downstream

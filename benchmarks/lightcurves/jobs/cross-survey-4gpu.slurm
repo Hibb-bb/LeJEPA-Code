@@ -41,7 +41,7 @@ echo "mode=$MODE wandb_run_id=$WANDB_RUN_ID"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 # srun launches one Lightning rank per GPU (SLURM env is auto-detected).
-srun python lejepa-mup-ladder.py \
+srun python pretrain.py \
     --dataset hibb/tess-ztf-atlas-asassn-isect \
     --exclude-instrument TESS --holdout-instrument ATLAS \
     --mode "$MODE" --local-mode instrument \

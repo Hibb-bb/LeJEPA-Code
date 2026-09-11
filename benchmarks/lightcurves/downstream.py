@@ -1,6 +1,6 @@
 """Offline downstream evaluation of a pretrained LeJEPA light-curve encoder.
 
-Loads a Lightning checkpoint produced by ``lejepa-mup-ladder.py``, embeds
+Loads a Lightning checkpoint produced by ``pretrain.py``, embeds
 every object once per instrument (mean of ``--n-eval-views`` un-augmented
 capped-span eval views, i.e. the same 500-1500-day windows the encoder was
 pretrained on) and runs two frozen-encoder downstream tasks:
@@ -31,21 +31,15 @@ Usage (matches the debug run's geometry)::
 """
 
 import argparse
-import importlib.util
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-# ``lejepa-mup-ladder.py`` has a hyphenated name: load it as a module so the
+# ``pretrain.py`` lives next to this script (sys.path[0]); import it so the
 # view pipeline, record loader and model builder stay single-sourced.
-_LADDER = Path(__file__).parent / "lejepa-mup-ladder.py"
-spec = importlib.util.spec_from_file_location("ladder", _LADDER)
-ladder = importlib.util.module_from_spec(spec)
-sys.modules["ladder"] = ladder  # DataLoader workers unpickle through this
-spec.loader.exec_module(ladder)
+import pretrain as ladder  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

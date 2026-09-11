@@ -57,15 +57,15 @@ Typical use::
     export HF_TOKEN=hf_...    # or `hf auth login`; read access to the private datasets
 
     # Step 0: lambda sweep at the reference config
-    python lejepa-mup-ladder.py --sweep-lamb "0.005,0.02,0.08,0.3" \
+    python pretrain.py --sweep-lamb "0.005,0.02,0.08,0.3" \
         --width 128 --epochs 50
 
     # Ladder rungs: same base lr, lambda rescaled from the anchor
-    python lejepa-mup-ladder.py --width 256 --lamb-ref <anchor> \
+    python pretrain.py --width 256 --lamb-ref <anchor> \
         --ref-width 128 --ref-proj-dim 32 --ref-batch-size 256
 
     # CPU smoke test (tiny, ~1 min): proves the pipeline end to end
-    python lejepa-mup-ladder.py --width 32 --depth 2 --epochs 1 \
+    python pretrain.py --width 32 --depth 2 --epochs 1 \
         --max-objects 96 --batch-size 8 --n-slices 64 \
         --global-tokens 96 --local-tokens 48 --num-workers 0 --precision 32
 """

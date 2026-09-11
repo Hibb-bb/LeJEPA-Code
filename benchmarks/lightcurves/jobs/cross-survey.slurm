@@ -42,7 +42,7 @@ export WANDB_RUN_ID=cs${SLURM_ARRAY_JOB_ID}-${MODE}
 echo "mode=$MODE wandb_run_id=$WANDB_RUN_ID"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
-python lejepa-mup-ladder.py \
+python pretrain.py \
     --dataset hibb/tess-ztf-atlas-asassn-isect \
     --exclude-instrument TESS --holdout-instrument ATLAS \
     --mode "$MODE" --local-mode instrument \
