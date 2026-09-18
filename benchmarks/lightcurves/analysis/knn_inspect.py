@@ -123,6 +123,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # Reuse downstream's checkpoint loader (needs width/depth/... on args).
     args.width, args.depth = 256, 4
+    ladder.HEAD_DIM = 32  # pre-2026-09 checkpoints: 8 heads x 32
     args.projector, args.n_slices = "identity", 128
     backbone = ds_mod.load_backbone(args, device)
 
@@ -130,7 +131,8 @@ def main():
     labels = np.array([r["label"] for r in records])
     logp = np.array([np.log10(r["period"]) if r["period"] else np.nan
                      for r in records])
-    _, val_idx = ladder.stratified_split(records, 0.1, 0)
+    args.split_file, args.split_seed, args.val_frac, args.test_frac = None, 0, 0.1, 0.1
+    _, val_idx, _ = ladder.split_records(records, args)
     is_val_star = np.zeros(len(records), bool)
     is_val_star[val_idx] = True
 

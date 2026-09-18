@@ -1,0 +1,124 @@
+{
+  "definition": "Integral T(lambda) d(lambda) from first sample to percentile / full tabulated integral = p/100; no SED or additional photon weighting",
+  "filters": {
+    "g_ZTF": {
+      "survey": "ZTF",
+      "band": "g",
+      "profile_status": "survey_specific",
+      "source_filter_id": "Palomar/ZTF.g",
+      "angstrom": {
+        "10": 4271.933027,
+        "20": 4401.986982,
+        "30": 4534.594843,
+        "40": 4665.363115,
+        "50": 4796.469415,
+        "60": 4929.423865,
+        "70": 5063.122186,
+        "80": 5196.180763,
+        "90": 5330.46585
+      }
+    },
+    "r_ZTF": {
+      "survey": "ZTF",
+      "band": "r",
+      "profile_status": "survey_specific",
+      "source_filter_id": "Palomar/ZTF.r",
+      "angstrom": {
+        "10": 5814.354515,
+        "20": 5969.595436,
+        "30": 6124.108921,
+        "40": 6278.552872,
+        "50": 6435.493457,
+        "60": 6587.283576,
+        "70": 6739.273794,
+        "80": 6893.554381,
+        "90": 7048.55912
+      }
+    },
+    "i_ZTF": {
+      "survey": "ZTF",
+      "band": "i",
+      "profile_status": "survey_specific",
+      "source_filter_id": "Palomar/ZTF.i",
+      "angstrom": {
+        "10": 7320.171155,
+        "20": 7444.374609,
+        "30": 7572.090105,
+        "40": 7704.522993,
+        "50": 7843.135229,
+        "60": 7989.622931,
+        "70": 8146.552644,
+        "80": 8318.29312,
+        "90": 8511.398298
+      }
+    },
+    "c_ATLAS": {
+      "survey": "ATLAS",
+      "band": "c",
+      "profile_status": "survey_specific",
+      "source_filter_id": "Misc/Atlas.cyan",
+      "angstrom": {
+        "10": 4486.273649,
+        "20": 4742.086392,
+        "30": 4977.532094,
+        "40": 5202.996506,
+        "50": 5424.902136,
+        "60": 5642.490156,
+        "70": 5861.159664,
+        "80": 6079.466122,
+        "90": 6299.428986
+      }
+    },
+    "o_ATLAS": {
+      "survey": "ATLAS",
+      "band": "o",
+      "profile_status": "survey_specific",
+      "source_filter_id": "Misc/Atlas.orange",
+      "angstrom": {
+        "10": 5870.793143,
+        "20": 6118.303421,
+        "30": 6364.609611,
+        "40": 6608.125472,
+        "50": 6847.149138,
+        "60": 7093.253061,
+        "70": 7341.502817,
+        "80": 7597.589271,
+        "90": 7899.694627
+      }
+    },
+    "g_ASAS-SN": {
+      "survey": "ASAS-SN",
+      "band": "g",
+      "profile_status": "standard_band_proxy",
+      "source_filter_id": "SLOAN/SDSS.g",
+      "angstrom": {
+        "10": 4166.778946,
+        "20": 4334.581565,
+        "30": 4481.349833,
+        "40": 4616.830412,
+        "50": 4744.437419,
+        "60": 4868.066849,
+        "70": 4987.879532,
+        "80": 5104.52878,
+        "90": 5221.335216
+      }
+    },
+    "V_ASAS-SN": {
+      "survey": "ASAS-SN",
+      "band": "V",
+      "profile_status": "standard_band_proxy",
+      "source_filter_id": "Generic/Johnson.V",
+      "angstrom": {
+        "10": 5090.432098,
+        "20": 5203.733583,
+        "30": 5297.723908,
+        "40": 5388.548009,
+        "50": 5482.012137,
+        "60": 5590.634737,
+        "70": 5716.368631,
+        "80": 5857.084252,
+        "90": 6050.142886
+      }
+    }
+  }
+}

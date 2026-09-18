@@ -41,7 +41,7 @@ echo "mode=$MODE wandb_run_id=$WANDB_RUN_ID"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 srun python pretrain.py \
-    --dataset hibb/tess-ztf-atlas-asassn-isect+css \
+    --dataset pc/ZTF-ATLAS-ASASSN-CSS-LINEAR-PTF-isect \
     --exclude-instrument TESS --holdout-instrument ATLAS \
     --min-train-instruments 1 \
     --exclude-stars-file data/starembed_exclude_gaia.txt \
@@ -60,7 +60,7 @@ echo "downstream eval on $CKPT"
 unset WANDB_RUN_ID
 python downstream.py \
     --ckpt "$CKPT" \
-    --dataset hibb/tess-ztf-atlas-asassn-isect+css \
+    --dataset pc/ZTF-ATLAS-ASASSN-CSS-LINEAR-PTF-isect \
     --exclude-instrument TESS --holdout-instrument ATLAS \
     --min-train-instruments 1 \
     --exclude-stars-file data/starembed_exclude_gaia.txt \

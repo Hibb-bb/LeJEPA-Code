@@ -72,6 +72,7 @@ def main():
                             eval_tokens=512, min_tokens=8, norm="band-global")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     args.width, args.depth = 256, 4
+    ladder.HEAD_DIM = 32  # pre-2026-09 checkpoints: 8 heads x 32
     args.projector, args.n_slices = "identity", 128
 
     import umap

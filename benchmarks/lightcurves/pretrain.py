@@ -1,68 +1,10 @@
-"""LeJEPA width-transfer ladder on TESS-ZTF light curves: mu-P + lambda rule.
-
-Light-curve sibling of ``benchmarks/cifar10/lejepa-mup-ladder.py`` (read that
-script's docstring for the full mu-P + master-rule + Step-0 protocol). The
-control flow is identical: one invocation either trains ONE rung of the width
-ladder, or (with ``--sweep-lamb``) runs the automated Step-0 lambda sweep at a
-single configuration and reports the recommended anchor.
-
-What changes here is the *modality*. Instead of a timm ViT over image crops we
-train a :class:`~stable_pretraining.methods.LeJEPALightCurve` whose backbone is
-a CLS-pooled :class:`~stable_pretraining.backbone.RoMAELightCurveBackbone`
-(RoMAE encoder with continuous n-D rotary positions over time and
-log-wavelength). Data is the private ``hibb/TESS-ZTF-isect`` HF dataset: Gaia
-objects with a ``class_str`` variability label and a ``lightcurve`` dict of
-four bands — ``TESS`` (band 0) and ``g_ZTF``/``r_ZTF``/``i_ZTF`` (bands 1-3) —
-each an asynchronous ``(mjd, mag, mag_unc)`` series.
-
-View generation (``make_views``) is the piece that has no image analog and is
-the intended extension point:
-
-- **Uncertainty resampling** (primary augmentation): every view draws its flux
-  as ``mag + eps * mag_unc`` with an independent Gaussian ``eps``, so two draws
-  of the same segment are two views. Photometric noise is the nuisance the
-  representation is asked to be invariant to.
-- **Cross-instrument views**: the two GLOBAL views are, over the *same star and
-  the same time span*, one built from TESS-only observations and one from
-  ZTF-only observations. Pulling their embeddings together makes the
-  representation invariant to *which instrument* observed the star.
-- **Light-curve concat** (``--global-mode concat``): the globals are instead
-  the two chimeras ``TESS[lo,m) + ZTF[m,hi)`` and ``ZTF[lo,m) + TESS[m,hi)``
-  at a random split ``m`` — same star, same span, each half from a different
-  telescope (``both`` gives all four globals).
-- **Local views**: additional shorter, uncertainty-resampled sub-windows
-  (multi-crop analog). ``--local-mode all`` uses every band; ``instrument``
-  draws each local from a single telescope (50/50 TESS/ZTF) so the
-  cross-instrument invariance is also enforced at local scale; ``mixed``
-  coin-flips per local between the two.
-- **Per-view physics jitters** (off by default, see ``--p-*``): an achromatic
-  brightness offset mimicking a distance change, a chromatic CCM89 extinction
-  jitter (``extinction`` package) and a temporal shift of the window by an
-  integer number of catalog periods (a different cycle of the same star).
-  Views are standardised with per-object, per-band statistics fixed at load
-  time so these survive (``--norm``).
-
-Because sequences run to tens of thousands of observations while attention is
-O(N^2), each view is subsampled to a fixed token budget — this is both the
-augmentation mechanism and a hard memory bound.
-
-mu-P notes specific to RoMAE: ``apply_mup`` re-inits every Linear with the
-spectral std, and (thanks to the explicit ``scale`` attribute added to RoMAE's
-``Attention``) retunes the attention logit scale to ``1/head_dim``. RoMAE
-already passes ``scale=`` into ``F.scaled_dot_product_attention``, so no
-``set_fused_attn`` dance is needed (unlike the timm ViT scripts).
-
+"""
 Typical use::
 
-    export HF_TOKEN=hf_...    # or `hf auth login`; read access to the private datasets
-
-    # Step 0: lambda sweep at the reference config
-    python pretrain.py --sweep-lamb "0.005,0.02,0.08,0.3" \
-        --width 128 --epochs 50
-
-    # Ladder rungs: same base lr, lambda rescaled from the anchor
-    python pretrain.py --width 256 --lamb-ref <anchor> \
-        --ref-width 128 --ref-proj-dim 32 --ref-batch-size 256
+    # Local PC_matches data (default --dataset pc/ZTF-ATLAS-ASASSN-isect,
+    # read from $PC_MATCHES_ROOT or /projects/bfrf/data/PC_matches) needs no
+    # token; the legacy hibb/ HF Hub datasets need
+    export HF_TOKEN=hf_...    # or `hf auth login`
 
     # CPU smoke test (tiny, ~1 min): proves the pipeline end to end
     python pretrain.py --width 32 --depth 2 --epochs 1 \
@@ -79,8 +21,6 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-# All run outputs (wandb cache, checkpoints, UMAPs) live under runs/ next to
-# this file, whatever the cwd; SLURM logs go to logs/ (see jobs/*.slurm).
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 
 
@@ -118,14 +58,28 @@ from stable_pretraining.methods import LeJEPALightCurve
 from stable_pretraining.methods.lejepa import LeJEPA, LeJEPAOutput
 from stable_pretraining.optim import apply_mup, mup_param_groups
 
-# ---------------------------------------------------------------------------
-# Dataset-specific band layout (see stable_pretraining.backbone.romae).
-# 0 = TESS, 1/2/3 = ZTF g/r/i. The two "instruments" for cross-instrument
-# views are the TESS band and the ZTF band group.
-# ---------------------------------------------------------------------------
-# Instrument registry: dataset -> instrument -> {band column: wavelength nm}.
-# Band ids are assigned in this order at configure time.
+# Datasets. ``hibb/...`` ids are private HF Hub repos (need HF_TOKEN);
+# ``pc/<name>`` ids are the local PC_matches ``DatasetDict``s under
+# --data-root (default PC_MATCHES_ROOT / /projects/bfrf/data/PC_matches),
+# which ship their own unified train/validation/test split (a ``split``
+# column, disjoint by gaia id) and the corrected ASAS-SN photometry.
+PC_ROOT = Path(os.environ.get("PC_MATCHES_ROOT", "/projects/bfrf/data/PC_matches"))
+LOCAL_PREFIX = "pc/"
 INSTRUMENT_REGISTRY = {
+    "pc/ZTF-ATLAS-ASASSN-isect": {
+        "ZTF": {"g_ZTF": 472.0, "r_ZTF": 634.0, "i_ZTF": 789.0},
+        "ATLAS": {"c_ATLAS": 530.0, "o_ATLAS": 680.0},
+        "ASASSN": {"V_ASASSN": 550.0, "g_ASASSN": 480.0},
+    },
+    "pc/ZTF-ATLAS-ASASSN-CSS-LINEAR-PTF-isect": {
+        "ZTF": {"g_ZTF": 472.0, "r_ZTF": 634.0, "i_ZTF": 789.0},
+        "ATLAS": {"c_ATLAS": 530.0, "o_ATLAS": 680.0},
+        "ASASSN": {"V_ASASSN": 550.0, "g_ASASSN": 480.0},
+        "CSS": {"V_CSS": 550.0},
+        # LINEAR is unfiltered (clear); PTF g / Mould R.
+        "LINEAR": {"r_LINEAR": 600.0},
+        "PTF": {"g_PTF": 480.0, "R_PTF": 658.0},
+    },
     "hibb/TESS-ZTF-isect": {
         "TESS": {"TESS": 786.0},
         "ZTF": {"g_ZTF": 472.0, "r_ZTF": 634.0, "i_ZTF": 789.0},
@@ -136,12 +90,6 @@ INSTRUMENT_REGISTRY = {
         "ATLAS": {"c_ATLAS": 530.0, "o_ATLAS": 680.0},
         "ASASSN": {"V_ASASSN": 550.0, "g_ASASSN": 480.0},
     },
-    # Union with the archival Catalina (CSS/CRTS, 2005-2013, unfiltered
-    # calibrated to V) crossmatch. CSS is appended LAST so band ids 0-6 of
-    # the plain isect layout are unchanged (old checkpoints stay valid under
-    # their own registry key). Rows are merged by gaia_dr3_source_id; stars
-    # only in CSS train as single-instrument records (same-star different-
-    # epoch positives) when --min-train-instruments 1.
     "hibb/tess-ztf-atlas-asassn-isect+css": {
         "TESS": {"TESS": 786.0},
         "ZTF": {"g_ZTF": 472.0, "r_ZTF": 634.0, "i_ZTF": 789.0},
@@ -150,8 +98,6 @@ INSTRUMENT_REGISTRY = {
         "CSS": {"V_CSS": 550.0},
     },
 }
-# Pseudo-datasets above that are unions of several HF repos (merged by
-# gaia_dr3_source_id in load_records; first source wins on metadata).
 DATASET_SOURCES = {
     "hibb/tess-ztf-atlas-asassn-isect+css":
         ["hibb/tess-ztf-atlas-asassn-isect", "hibb/CSSxPC"],
@@ -159,11 +105,31 @@ DATASET_SOURCES = {
 DENSE_INSTRUMENTS = ("TESS",)  # minutes cadence: density-randomised views
 _EXT_PER_EBV = {}  # r_v -> {band: A_lambda/E(B-V)}, lazily built
 
+# Filter transmission percentiles (nm): band column -> {10: .., 50: .., 90: ..}
+# from data/filter_percentiles.json (SVO profiles; "p% of the integrated
+# transmission lies bluewards of lambda_p"). Keys there use survey-native
+# names ("g_ASAS-SN"); ours drop the hyphen, so match on that.
+FILTER_PERCENTILES_FILE = Path(__file__).resolve().parent / "data" / "filter_percentiles.json"
+WAVE_PERCENTILES = (10, 50, 90)
+
+
+def load_filter_percentiles(path=FILTER_PERCENTILES_FILE):
+    """Return ``{band column: {percentile(int): wavelength nm}}``."""
+    import json
+    raw = json.loads(Path(path).read_text())["filters"]
+    out = {}
+    for name, d in raw.items():
+        key = name.replace("-", "")
+        out[key] = {int(p): float(a) / 10.0 for p, a in d["angstrom"].items()}
+    return out
+
+
 # Filled by configure_instruments(); module globals so every view function
 # (which runs in DataLoader workers via fork) sees the same layout.
 DATASET = "hibb/TESS-ZTF-isect"
 BAND_NAMES = {}          # band id -> column name
-BAND_WAVELENGTHS = {}    # band id -> nm
+BAND_WAVELENGTHS = {}    # band id -> effective wavelength nm (extinction + default position)
+BAND_PERCENTILES = {}    # band id -> {10: nm, 50: nm, 90: nm}; missing bands are absent
 INST_BANDS = {}          # instrument -> tuple of band ids
 INSTRUMENTS = ()         # all instruments (eval / probes)
 TRAIN_INSTRUMENTS = ()   # instruments usable for LeJEPA views
@@ -173,15 +139,26 @@ DENSE_BANDS = ()
 
 
 def configure_instruments(dataset: str, holdout: str | None = None,
-                          exclude: tuple = ()):
+                          exclude: tuple = (), exclude_bands: tuple = ()):
     """Set the module-level band layout for ``dataset`` (see registry).
 
     ``exclude`` drops instruments entirely (their bands are never loaded);
-    ``holdout`` keeps one out of the LeJEPA views but probes/evaluates it.
+    ``exclude_bands`` drops single band columns (e.g. ``i_ZTF``, the
+    StarEmbed convention: ZTF g + r only); ``holdout`` keeps one instrument
+    out of the LeJEPA views but probes/evaluates it. Bands within an
+    instrument are ordered blue -> red so band position k means the same
+    thing across surveys (handcrafted-feature concatenation relies on it).
     """
-    global DATASET, BAND_NAMES, BAND_WAVELENGTHS, INST_BANDS, INSTRUMENTS
-    global TRAIN_INSTRUMENTS, HOLDOUT, ALL_BANDS, DENSE_BANDS, BAND_WAVELENGTHS_AA
-    reg = {k: v for k, v in INSTRUMENT_REGISTRY[dataset].items() if k not in exclude}
+    global DATASET, BAND_NAMES, BAND_WAVELENGTHS, BAND_PERCENTILES, INST_BANDS
+    global INSTRUMENTS, TRAIN_INSTRUMENTS, HOLDOUT, ALL_BANDS, DENSE_BANDS
+    global BAND_WAVELENGTHS_AA
+    reg = {k: dict(sorted(((c, w) for c, w in v.items() if c not in exclude_bands),
+                          key=lambda cw: cw[1]))
+           for k, v in INSTRUMENT_REGISTRY[dataset].items() if k not in exclude}
+    unknown = set(exclude_bands) - {c for v in INSTRUMENT_REGISTRY[dataset].values() for c in v}
+    if unknown:
+        raise ValueError(f"--exclude-band {sorted(unknown)} not in {dataset}")
+    reg = {k: v for k, v in reg.items() if v}
     if len(reg) < 2:
         raise ValueError(f"need >= 2 instruments after excluding {exclude}")
     DATASET = dataset
@@ -201,7 +178,153 @@ def configure_instruments(dataset: str, holdout: str | None = None,
     DENSE_BANDS = tuple(b for x in DENSE_INSTRUMENTS if x in INST_BANDS
                         for b in INST_BANDS[x])
     BAND_WAVELENGTHS_AA = {b: w * 10.0 for b, w in BAND_WAVELENGTHS.items()}
+    pct = load_filter_percentiles()
+    BAND_PERCENTILES = {b: pct[n] for b, n in BAND_NAMES.items() if n in pct}
+    missing = [n for n in BAND_NAMES.values() if n not in pct]
+    if missing:
+        logger.warning(f"no filter percentiles for {missing}; percentile "
+                       f"wavelength positions unavailable for those bands")
     _EXT_PER_EBV.clear()
+
+
+# ---------------------------------------------------------------------------
+# Wavelength encoding ablation (--wave-pos / --wave-ctx / --pool / ...).
+# configure_wave() fills these from the CLI after configure_instruments():
+#   BAND_POS  band id -> tuple of extra rotary position coords (after time)
+#   BAND_FEAT band id -> tuple of per-band content features (extra value
+#             channels, linearly embedded by the tubelet projection) or None
+#   ROPE_BLOCKS head-dim layout for BlockRope, or None (= NDPRope equal split)
+# ---------------------------------------------------------------------------
+WAVE_POS_CHOICES = ("eff", "pct", "pct-nd", "width", "index", "none")
+WAVE_CTX_CHOICES = ("none", "pct", "onehot")
+WAVE = dict(pos="eff", ctx="none", pool="cls", scale=1.0, shuffle=False,
+            time_frac=0.5, p_rope=0.75)
+BAND_POS = {}
+BAND_FEAT = None
+ROPE_BLOCKS = None
+N_POS_DIMS = 2
+N_CHANNELS = 1
+
+
+def add_wave_args(ap):
+    """CLI flags shared by pretrain.py and downstream.py (must match the
+    checkpoint)."""
+    ap.add_argument("--wave-pos", choices=WAVE_POS_CHOICES, default="eff",
+                    help="wavelength as rotary POSITION: eff = log effective "
+                         "wavelength (1 axis); pct = log 10/50/90%% "
+                         "transmission percentiles (3 axial axes); pct-nd = "
+                         "same 3 coords encoded jointly with nD-RoPE "
+                         "(simplex block); width = log lambda50 + log "
+                         "(lambda90/lambda10) (2 axes); index = raw band id; "
+                         "none = time only")
+    ap.add_argument("--wave-ctx", choices=WAVE_CTX_CHOICES, default="none",
+                    help="wavelength as token CONTENT (extra input channels): "
+                         "pct = log percentile triple; onehot = band id "
+                         "(non-transferable ceiling)")
+    ap.add_argument("--pool", choices=["cls", "mean"], default="cls",
+                    help="cls: CLS sits at rotary position 0, so absolute "
+                         "wavelength leaks in via CLS attention; mean: only "
+                         "relative wavelength is visible")
+    ap.add_argument("--wavelength-scale", type=float, default=1.0,
+                    help="log-wavelength coords are divided by this")
+    ap.add_argument("--shuffle-wave", action="store_true",
+                    help="sanity control: permute the band -> wavelength "
+                         "descriptor mapping (positions and features) with "
+                         "a fixed seed; extinction physics unaffected")
+    ap.add_argument("--time-frac", type=float, default=0.5,
+                    help="fraction of head_dim rotated by time; the rest is "
+                         "shared by the wavelength axes")
+    ap.add_argument("--p-rope", type=float, default=0.75)
+    ap.add_argument("--head-dim", type=int, default=HEAD_DIM)
+
+
+def _even_split(total, k):
+    """Split ``total`` (even) into ``k`` even parts, as equal as possible."""
+    if k == 0:
+        return []
+    pairs = total // 2
+    base, extra = divmod(pairs, k)
+    return [2 * (base + (1 if i < extra else 0)) for i in range(k)]
+
+
+def configure_wave(args):
+    """Derive BAND_POS / BAND_FEAT / ROPE_BLOCKS from the CLI (after
+    :func:`configure_instruments`)."""
+    global BAND_POS, BAND_FEAT, ROPE_BLOCKS, N_POS_DIMS, N_CHANNELS, HEAD_DIM
+    WAVE.update(pos=args.wave_pos, ctx=args.wave_ctx, pool=args.pool,
+                scale=args.wavelength_scale, shuffle=args.shuffle_wave,
+                time_frac=args.time_frac, p_rope=args.p_rope)
+    HEAD_DIM = args.head_dim
+    if HEAD_DIM % 2:
+        raise ValueError(f"--head-dim must be even, got {HEAD_DIM}")
+    bands = list(ALL_BANDS)
+    eff = {b: BAND_WAVELENGTHS[b] for b in bands}
+    pct = {b: BAND_PERCENTILES.get(b) for b in bands}
+    if WAVE["shuffle"]:
+        perm = np.random.default_rng(1000 + args.split_seed).permutation(len(bands))
+        eff = {b: eff[bands[j]] for b, j in zip(bands, perm)}
+        pct = {b: pct[bands[j]] for b, j in zip(bands, perm)}
+        logger.warning(f"--shuffle-wave: band->descriptor permutation {perm.tolist()}")
+    need_pct = WAVE["pos"] in ("pct", "pct-nd", "width") or WAVE["ctx"] == "pct"
+    if need_pct and any(v is None for v in pct.values()):
+        raise ValueError(f"filter percentiles missing for "
+                         f"{[BAND_NAMES[b] for b, v in pct.items() if v is None]}")
+    ref = float(np.exp(np.mean([np.log(w) for w in eff.values()])))
+    sc = WAVE["scale"]
+    lg = lambda lam: float(np.log(lam / ref) / sc)  # noqa: E731
+    if WAVE["pos"] == "eff":
+        BAND_POS = {b: (lg(eff[b]),) for b in bands}
+    elif WAVE["pos"] in ("pct", "pct-nd"):
+        BAND_POS = {b: tuple(lg(pct[b][q]) for q in WAVE_PERCENTILES) for b in bands}
+    elif WAVE["pos"] == "width":
+        BAND_POS = {b: (lg(pct[b][50]), float(np.log(pct[b][90] / pct[b][10]) / sc))
+                    for b in bands}
+    elif WAVE["pos"] == "index":
+        BAND_POS = {b: (float(b),) for b in bands}
+    else:
+        BAND_POS = {b: () for b in bands}
+    if WAVE["ctx"] == "pct":
+        BAND_FEAT = {b: tuple(lg(pct[b][q]) for q in WAVE_PERCENTILES) for b in bands}
+    elif WAVE["ctx"] == "onehot":
+        BAND_FEAT = {b: tuple(1.0 if j == i else 0.0 for j in range(len(bands)))
+                     for i, b in enumerate(bands)}
+    else:
+        BAND_FEAT = None
+    n_wave = len(next(iter(BAND_POS.values())))
+    N_POS_DIMS = 1 + n_wave
+    N_CHANNELS = 1 + (len(next(iter(BAND_FEAT.values()))) if BAND_FEAT else 0)
+
+    # Rotary layout: time keeps ~time_frac of the head channels, the
+    # wavelength axes share the rest (equal axial slices, or one simplex
+    # block whose size must be a multiple of 2*(n+1)).
+    p = WAVE["p_rope"]
+    if n_wave == 0:
+        wave_dim = 0
+    elif WAVE["pos"] == "pct-nd":
+        unit = 2 * (n_wave + 1)
+        wave_dim = max(unit, (int(round(HEAD_DIM * (1 - WAVE["time_frac"]))) // unit) * unit)
+    else:
+        wave_dim = 2 * (int(round(HEAD_DIM * (1 - WAVE["time_frac"]))) // 2)
+        wave_dim = max(2 * n_wave, wave_dim)
+    time_dim = HEAD_DIM - wave_dim
+    if time_dim < 2:
+        raise ValueError(f"head_dim {HEAD_DIM} too small for {n_wave} wavelength axes")
+    blocks = [dict(kind="axial", axes=[0], dim=time_dim, p=p)]
+    if WAVE["pos"] == "pct-nd":
+        blocks.append(dict(kind="simplex", axes=list(range(1, N_POS_DIMS)),
+                           dim=wave_dim, p=p, seed=args.seed))
+    else:
+        for i, d in enumerate(_even_split(wave_dim, n_wave)):
+            blocks.append(dict(kind="axial", axes=[1 + i], dim=d, p=p))
+    # Equal axial split == plain NDPRope (keeps old checkpoint keys valid).
+    if all(b["kind"] == "axial" for b in blocks) and len({b["dim"] for b in blocks}) == 1:
+        ROPE_BLOCKS = None
+    else:
+        ROPE_BLOCKS = blocks
+    logger.info(f"wave encoding: pos={WAVE['pos']} ctx={WAVE['ctx']} "
+                f"pool={WAVE['pool']} n_pos_dims={N_POS_DIMS} "
+                f"n_channels={N_CHANNELS} head_dim={HEAD_DIM} rope="
+                f"{[(b['kind'], b['axes'], b['dim']) for b in blocks]}")
 
 
 def _inst_times(record, inst):
@@ -223,11 +346,14 @@ def _record_instruments(record, min_obs=1, train_only=False):
 REF_WIDTH = 128
 REF_PROJ_DIM = 32
 REF_BATCH_SIZE = 128
+DEFAULT_WIDTH = 360   # 6 heads x 60; default depth 6 (RoMAE-base 720x12 OOMs at batch 128)
 
 BASE_FANIN = 256  # mu-P normalization: fan_in at which lr mult == 1
-# RoMAE head_dim: fixed across the ladder (mu-P grows the head COUNT). Must be
-# divisible by 4 (2 position axes x 2 rotation halves in NDPRope).
-HEAD_DIM = 32
+# RoMAE head_dim: fixed across the ladder (mu-P grows the head COUNT).
+# 60 = 720 / 12 heads (RoMAE-base). Must be even; the rotary layout over the
+# position axes is derived from it in configure_wave() (--head-dim overrides,
+# e.g. 32 to load pre-2026-09 checkpoints).
+HEAD_DIM = 60
 
 
 def master_lambda(
@@ -827,7 +953,7 @@ class LightCurveDataset(torch.utils.data.Dataset):
             x in FAINT_MAG and med.get(x, -np.inf) > FAINT_MAG[x]
             for x in INSTRUMENTS
         )
-        return (probe, views, view_inst, faint), rec["label"]
+        return (probe, views, view_inst, faint, rec.get("uid", i)), rec["label"]
 
 
 def _tokenize_batch(view_list):
@@ -835,8 +961,11 @@ def _tokenize_batch(view_list):
     times = [t for (t, _, _) in view_list]
     values = [v for (_, v, _) in view_list]
     bands = [b for (_, _, b) in view_list]
+    if not BAND_POS:  # configure_wave() not called (legacy analysis scripts)
+        return tokenize_lightcurves(times, values, bands,
+                                    band_wavelengths=BAND_WAVELENGTHS)
     return tokenize_lightcurves(
-        times, values, bands, band_wavelengths=BAND_WAVELENGTHS
+        times, values, bands, band_positions=BAND_POS, band_features=BAND_FEAT
     )
 
 
@@ -855,6 +984,10 @@ def collate(batch, n_global: int = 2):
     out["inst_valid"] = torch.tensor([it[0][1] for it in items], dtype=torch.bool)
     out["inst_faint"] = torch.tensor([it[3] for it in items], dtype=torch.bool)
     out["label"] = torch.tensor(labels, dtype=torch.long)
+    # Dataset-level star index: with --oversample-paired the same star can
+    # sit twice in a batch, and a contrastive loss must treat those rows as
+    # positives (see pretrain_contrastive.py), not as false negatives.
+    out["star_id"] = torch.tensor([it[4] for it in items], dtype=torch.long)
     if items[0][1] is not None:
         n_views = len(items[0][1])
         for j in range(n_views):
@@ -919,6 +1052,9 @@ def _to_record(ex, label_to_idx):
         "label": label_to_idx[ex["class_str"]], "bands": bands,
         "period": period, "norm": norm, "inst_med_mag": med_mag,
         "gaia": ex.get("gaia_dr3_source_id"),
+        # Local PC_matches datasets carry their own unified split (train /
+        # validation / test) and a coarser superclass label.
+        "split": ex.get("split"), "superclass": ex.get("superclass_str"),
     }
 
 
@@ -927,20 +1063,46 @@ def _has_two_instruments(rec, min_obs, min_insts=2):
     return len(_record_instruments(rec, min_obs, train_only=True)) >= min_insts
 
 
+def is_local_dataset(name: str = None) -> bool:
+    """``pc/<name>`` = local PC_matches DatasetDict (own split column)."""
+    return (name or DATASET).startswith(LOCAL_PREFIX)
+
+
+def _iter_source(src, args, token):
+    """Yield raw examples of one source: HF Hub ``train`` split, or every
+    split of a local PC_matches DatasetDict (``ex["split"]`` says which).
+    ``--max-objects`` caps the rows per (source, split) for smoke tests."""
+    from datasets import load_dataset, load_from_disk
+
+    if is_local_dataset(src):
+        root = Path(getattr(args, "data_root", None) or PC_ROOT)
+        path = root / src[len(LOCAL_PREFIX):]
+        if not path.exists():
+            raise FileNotFoundError(f"local dataset {src!r} not found at {path} "
+                                    f"(set --data-root / PC_MATCHES_ROOT)")
+        dd = load_from_disk(str(path))
+        splits = [dd[k] for k in ("train", "validation", "test") if k in dd]
+    else:
+        if token is None:
+            raise RuntimeError(
+                "Set HF_TOKEN, run `hf auth login`, or pass --hf-token with "
+                f"read access to {src} — it is a private dataset."
+            )
+        splits = [load_dataset(src, split="train", token=token)]
+    for ds in splits:
+        if args.max_objects > 0:
+            ds = ds.select(range(min(args.max_objects, len(ds))))
+        yield from ds
+
+
 def load_records(args):
     """Load ``args.dataset`` into per-object records + a label map.
 
-    Requires ``HF_TOKEN`` in the environment (read access to the private
-    dataset). ``--max-objects`` keeps only the first N rows (smoke tests).
+    HF Hub datasets need ``HF_TOKEN`` (private repos); local ``pc/`` datasets
+    are read from --data-root. ``--max-objects`` keeps only the first N rows
+    per split (smoke tests).
     """
-    from datasets import load_dataset
-
-    token = resolve_hf_token(args.hf_token)
-    if token is None:
-        raise RuntimeError(
-            "Set HF_TOKEN, run `hf auth login`, or pass --hf-token with read access to "
-            f"{DATASET} — it is a private dataset."
-        )
+    token = resolve_hf_token(args.hf_token) if not is_local_dataset() else None
 
     # Optional star blacklist (e.g. StarEmbed val/test/anom crossmatches):
     # one gaia_dr3_source_id per line; matching rows never become records.
@@ -956,10 +1118,7 @@ def load_records(args):
     sources = DATASET_SOURCES.get(DATASET, [DATASET])
     merged, order, n_excl = {}, [], 0
     for src in sources:
-        ds = load_dataset(src, split="train", token=token)
-        if args.max_objects > 0:  # smoke tests: first N rows per source
-            ds = ds.select(range(min(args.max_objects, len(ds))))
-        for j, ex in enumerate(ds):
+        for j, ex in enumerate(_iter_source(src, args, token)):
             gid = ex.get("gaia_dr3_source_id")
             if gid in excl:
                 n_excl += 1
@@ -986,6 +1145,7 @@ def load_records(args):
     for ex in raw:
         rec = _to_record(ex, label_to_idx)
         if _has_two_instruments(rec, args.min_obs, min_insts):
+            rec["uid"] = len(records)  # dataset-level star index (see collate)
             records.append(rec)
 
     # --norm band-global: one dataset-wide scale (median of the per-object
@@ -1007,27 +1167,99 @@ def load_records(args):
     return records, label_to_idx
 
 
-def stratified_split(records, val_frac, seed):
-    """Deterministic per-class stratified train/val index split."""
+def stratified_split(records, val_frac, seed, test_frac=0.0):
+    """Deterministic per-class stratified train/val/test index split.
+
+    Fallback for when no split file is given (see :func:`split_records`).
+    Returns ``(train_idx, val_idx, test_idx)``; ``test_idx`` is empty when
+    ``test_frac == 0``.
+    """
     rng = np.random.default_rng(seed)
     by_class = {}
     for i, r in enumerate(records):
         by_class.setdefault(r["label"], []).append(i)
-    train_idx, val_idx = [], []
+    train_idx, val_idx, test_idx = [], [], []
     for _, idxs in sorted(by_class.items()):
         idxs = np.array(idxs)
         rng.shuffle(idxs)
         n_val = int(round(len(idxs) * val_frac))
+        n_test = int(round(len(idxs) * test_frac))
         val_idx.extend(idxs[:n_val].tolist())
-        train_idx.extend(idxs[n_val:].tolist())
-    return sorted(train_idx), sorted(val_idx)
+        test_idx.extend(idxs[n_val:n_val + n_test].tolist())
+        train_idx.extend(idxs[n_val + n_test:].tolist())
+    return sorted(train_idx), sorted(val_idx), sorted(test_idx)
+
+
+def default_split_file(dataset, seed=0):
+    """``data/splits/<dataset basename>_seed<seed>.json`` (built by
+    ``data/make_splits.py``)."""
+    return (Path(__file__).resolve().parent / "data" / "splits"
+            / f"{dataset.split('/')[-1]}_seed{seed}.json")
+
+
+def split_records(records, args):
+    """Star-level train/val/test split of ``records`` -> index lists.
+
+    The canonical split is a file of ``gaia_dr3_source_id`` lists written
+    once by ``data/make_splits.py`` over the *whole* HF dataset (stratified
+    by ``class_str``), so every run — whatever its ``--min-obs``,
+    ``--holdout-instrument`` or exclusion filters — holds out the identical
+    stars. ``--split-file`` selects it; the default path is
+    :func:`default_split_file` for ``--dataset``/``--split-seed``. Records
+    absent from the file (no gaia id, or a star the file predates) go to
+    train and are counted in the log. With ``--split-file none`` the old
+    on-the-fly stratified split is used (``--val-frac``/``--test-frac``).
+    """
+    if is_local_dataset():
+        # The dataset's own split column is the canonical one; --split-file
+        # is ignored for pc/ datasets.
+        names = {"train": "train", "validation": "val", "val": "val",
+                 "test": "test"}
+        out = {"train": [], "val": [], "test": []}
+        for i, r in enumerate(records):
+            out[names[r["split"]]].append(i)
+        logger.info(f"dataset split column: {len(out['train'])} train / "
+                    f"{len(out['val'])} val / {len(out['test'])} test objects")
+        return out["train"], out["val"], out["test"]
+    sf = getattr(args, "split_file", None)
+    if sf is None:
+        sf = default_split_file(DATASET, args.split_seed)
+    if str(sf).lower() != "none" and Path(sf).exists():
+        import json
+        d = json.loads(Path(sf).read_text())
+        where = {}
+        for name in ("train", "val", "test"):
+            for g in d[name]:
+                where[str(g)] = name
+        out = {"train": [], "val": [], "test": []}
+        n_unlisted = 0
+        for i, r in enumerate(records):
+            g = r.get("gaia")
+            name = where.get(str(g)) if g else None
+            if name is None:
+                n_unlisted += 1
+                name = "train"
+            out[name].append(i)
+        logger.info(f"split file {sf}: {len(out['train'])} train / "
+                    f"{len(out['val'])} val / {len(out['test'])} test objects "
+                    f"({n_unlisted} unlisted -> train)")
+        return out["train"], out["val"], out["test"]
+    if str(sf).lower() != "none":
+        logger.warning(f"split file {sf} not found; falling back to an "
+                       f"on-the-fly stratified split (run data/make_splits.py)")
+    tr, va, te = stratified_split(records, args.val_frac, args.split_seed,
+                                  getattr(args, "test_frac", 0.0))
+    logger.info(f"stratified split: {len(tr)} train / {len(va)} val / "
+                f"{len(te)} test objects")
+    return tr, va, te
 
 
 def build_data(args, records, cfg):
-    train_idx, val_idx = stratified_split(records, args.val_frac, args.split_seed)
+    # Test stars are never touched here: the encoder trains on train, its
+    # online probes watch val; downstream.py reports val and test.
+    train_idx, val_idx, _ = split_records(records, args)
     train_recs = [records[i] for i in train_idx]
     val_recs = [records[i] for i in val_idx]
-    logger.info(f"split: {len(train_recs)} train / {len(val_recs)} val objects")
     k = getattr(args, "oversample_paired", 1)
     if k > 1:
         paired = [r for r in train_recs
@@ -1036,7 +1268,7 @@ def build_data(args, records, cfg):
         logger.info(f"oversampled {len(paired)} multi-instrument stars x{k}: "
                     f"train epoch now {len(train_recs)} items")
 
-    with_views = args.mode == "lejepa"
+    with_views = args.mode in VIEW_MODES
     train_ds = LightCurveDataset(train_recs, cfg, train=True, with_views=with_views)
     val_ds = LightCurveDataset(val_recs, cfg, train=False, seed=args.seed,
                                with_views=with_views)
@@ -1062,6 +1294,14 @@ def build_data(args, records, cfg):
 # ---------------------------------------------------------------------------
 # Model + forward
 # ---------------------------------------------------------------------------
+# Modes whose train batches carry LeJEPA-style global/local views. Sibling
+# scripts (pretrain_contrastive.py) register their mode here, in FORWARDS
+# and in MODEL_BUILDERS (mode -> fn(args, n_classes) -> model).
+VIEW_MODES = {"lejepa"}
+FORWARDS = {}
+MODEL_BUILDERS = {}
+
+
 def build_model(width, proj_dim, lamb, n_slices, depth, mode="lejepa",
                 n_classes=None, projector="identity"):
     """One ladder rung: RoMAE encoder at ``width`` + SIGReg projector.
@@ -1076,13 +1316,12 @@ def build_model(width, proj_dim, lamb, n_slices, depth, mode="lejepa",
     a linear head instead (frozen in ``random``).
     """
     assert width % HEAD_DIM == 0, f"width must be a multiple of head_dim={HEAD_DIM}"
-    assert HEAD_DIM % 4 == 0, "head_dim must be divisible by 4 (2 axes x 2 halves)"
     nhead = width // HEAD_DIM
 
     backbone = RoMAELightCurveBackbone(
         encoder_kwargs=dict(d_model=width, nhead=nhead, depth=depth),
-        tubelet_size=(1, 1, 1), n_channels=1, n_pos_dims=2, p_rope_val=0.75,
-        pool="cls",
+        tubelet_size=(1, 1, 1), n_channels=N_CHANNELS, n_pos_dims=N_POS_DIMS,
+        p_rope_val=WAVE["p_rope"], rope_blocks=ROPE_BLOCKS, pool=WAVE["pool"],
     )
     if mode != "lejepa":
         model = apply_mup(
@@ -1102,8 +1341,18 @@ def build_model(width, proj_dim, lamb, n_slices, depth, mode="lejepa",
             inplace=True,
             dropout=0.0,
         )
+    predictor = pred_inst = None
+    if PREDICTOR_INST is not None:
+        # Encoder -> predictor (this instrument's views only) -> projector.
+        pred_inst = TRAIN_INSTRUMENTS.index(PREDICTOR_INST)
+        predictor = MLP(
+            in_channels=width, hidden_channels=[PREDICTOR_HIDDEN, width],
+            norm_layer="batch_norm", activation_layer=nn.ReLU,
+            inplace=True, dropout=0.0,
+        )
     model = LeJEPALightCurve(
-        backbone, projector=proj, lamb=lamb, n_slices=n_slices
+        backbone, projector=proj, lamb=lamb, n_slices=n_slices,
+        predictor=predictor, predictor_inst=pred_inst,
     )
     if ADV_WEIGHT > 0:
         # Linear telescope discriminator fed through the gradient-reversal
@@ -1112,19 +1361,14 @@ def build_model(width, proj_dim, lamb, n_slices, depth, mode="lejepa",
     return apply_mup(model, base_fanin=BASE_FANIN)
 
 
-def _val_losses(model, global_views, local_views):
+def _val_losses(model, global_views, local_views, view_inst=None):
     """LeJEPA loss on a view set with the model in eval mode.
 
     ``LeJEPALightCurve.forward`` only computes the loss when ``self.training``,
-    so validation replicates its training branch here (BatchNorm in the
-    projector uses running stats, which is what we want for a val metric).
+    so validation calls its building block directly (BatchNorm in the
+    projector/predictor uses running stats, which is what we want here).
     """
-    all_views = list(global_views) + list(local_views)
-    feats = [model._encode(v) for v in all_views]
-    proj = model.projector(torch.cat(feats))
-    bs = global_views[0][0].shape[0]
-    proj = proj.view(len(all_views), bs, -1)
-    return LeJEPA._compute_loss(proj, len(global_views), model.sigreg, model.lamb)
+    return model.loss_on_views(global_views, local_views, view_inst)[:3]
 
 
 TRANSFER_PROBES = True
@@ -1173,6 +1417,8 @@ def _probe_embeddings(backbone, batch, out, stage):
     out["label"] = batch["label"].long()
 
 
+PREDICTOR_INST = None    # --predictor-instrument: its views get a predictor
+PREDICTOR_HIDDEN = 1024  # --predictor-hidden
 ADV_WEIGHT = 0.0   # GRL strength for the instrument-confusion loss (CLI)
 ADV_RAMP = 0.1     # fraction of training over which the GRL strength ramps
 FAINT_MAG = {}     # instrument -> median-mag threshold: stars fainter than
@@ -1229,7 +1475,8 @@ def lejepa_forward(self, batch, stage):
     local_views = [batch[k] for k in sorted(batch) if k.startswith("local")]
     if stage == "fit":
         output: LeJEPAOutput = self.model.forward(
-            global_views=global_views, local_views=local_views
+            global_views=global_views, local_views=local_views,
+            view_inst=batch["view_inst"],
         )
         loss, pred_loss, sigreg_loss = (
             output.loss, output.inv_loss, output.sigreg_loss
@@ -1252,7 +1499,7 @@ def lejepa_forward(self, batch, stage):
         )
         # ... and the deterministic view set -> real validation losses.
         loss, pred_loss, sigreg_loss = _val_losses(
-            self.model, global_views, local_views
+            self.model, global_views, local_views, batch["view_inst"]
         )
         tag = "val"
 
@@ -1314,6 +1561,10 @@ def supervised_forward(self, batch, stage):
     self.log(f"{tag}/ce", loss, on_step=stage == "fit", on_epoch=True,
              sync_dist=True)
     return out
+
+
+FORWARDS.update(lejepa=lejepa_forward, random=random_forward,
+                supervised=supervised_forward)
 
 
 class SupervisedLightCurve(nn.Module):
@@ -1574,11 +1825,13 @@ def train_once(args, lamb, records, n_classes, cfg, sweep_mode=False,
     """
     pl.seed_everything(args.seed, workers=True)
     data = build_data(args, records, cfg)
-    model = build_model(args.width, args.proj_dim, lamb, args.n_slices,
-                        args.depth, mode=args.mode, n_classes=n_classes,
-                        projector=args.projector)
-    forward = {"lejepa": lejepa_forward, "random": random_forward,
-               "supervised": supervised_forward}[args.mode]
+    if args.mode in MODEL_BUILDERS:
+        model = MODEL_BUILDERS[args.mode](args, n_classes)
+    else:
+        model = build_model(args.width, args.proj_dim, lamb, args.n_slices,
+                            args.depth, mode=args.mode, n_classes=n_classes,
+                            projector=args.projector)
+    forward = FORWARDS[args.mode]
 
     module = spt.Module(
         model=model,
@@ -1657,11 +1910,13 @@ def train_once(args, lamb, records, n_classes, cfg, sweep_mode=False,
             save_dir=str(RUNS_DIR),
             name=f"{args.mode}-{DATASET.split('/')[-1].replace('-isect', '')}"
                  + "".join(f"-no{x}" for x in args.exclude_instrument)
+                 + "".join(f"-no{x}" for x in args.exclude_band)
                  + (f"-hold{HOLDOUT}" if HOLDOUT else "")
                  + f"-w{args.width}-d{args.proj_dim}-B{args.batch_size}"
-                 f"-lam{lamb:.4g}"
+                 + (f"-lam{lamb:.4g}" if args.mode == "lejepa" else "")
                  + (f"-adv{args.adv_weight:g}" if args.adv_weight > 0 else "")
-                 + ("-idproj" if args.projector == "identity" else ""),
+                 + ("-idproj" if args.projector == "identity" else "")
+                 + (f"-pred{PREDICTOR_INST}" if PREDICTOR_INST else ""),
             config={**vars(args), "lamb": lamb, "sweep_mode": sweep_mode},
         )
     else:
@@ -1688,20 +1943,29 @@ def train_once(args, lamb, records, n_classes, cfg, sweep_mode=False,
     return witness_proj, witness_emb
 
 
-def main():
+def build_parser():
+    """The CLI; sibling scripts extend it (see pretrain_contrastive.py)."""
     ap = argparse.ArgumentParser()
     # --- ladder / mu-P (mirror the cifar10 script) ---
-    ap.add_argument("--width", type=int, default=REF_WIDTH,
+    ap.add_argument("--width", type=int, default=DEFAULT_WIDTH,
                     help="encoder d_model (one rung of the ladder)")
-    ap.add_argument("--depth", type=int, default=4, help="encoder depth")
+    ap.add_argument("--depth", type=int, default=6,
+                    help="encoder depth")
     ap.add_argument("--proj-dim", type=int, default=REF_PROJ_DIM,
                     help="SIGReg dimension = projector output dim")
     ap.add_argument("--projector", choices=["identity", "mlp"],
-                    default="identity",
-                    help="identity (default): SIGReg + prediction loss act "
-                         "directly on the backbone embeddings (proj dim = "
-                         "width, 128 by default); mlp: BN+ReLU "
-                         "2048-2048-proj_dim head")
+                    default="mlp",
+                    help="mlp (default): BN+ReLU 2048-2048-proj_dim head; the "
+                         "prediction + SIGReg losses act on its output while "
+                         "probes/downstream read the encoder embedding; "
+                         "identity: losses act directly on the embeddings "
+                         "(proj dim = width)")
+    ap.add_argument("--predictor-instrument", default=None,
+                    help="LeJEPA: views of this (lower-quality) training "
+                         "instrument, e.g. ASASSN, pass through an MLP "
+                         "predictor between encoder and projector")
+    ap.add_argument("--predictor-hidden", type=int, default=PREDICTOR_HIDDEN,
+                    help="hidden width of the predictor MLP")
     ap.add_argument("--lamb-ref", type=float, default=0.02,
                     help="additive lambda tuned at the REFERENCE rung; "
                          "rescaled here by the master rule")
@@ -1712,18 +1976,27 @@ def main():
     ap.add_argument("--base-lr", type=float, default=4e-4,
                     help="mu-P base lr (transfers as-is across widths)")
     ap.add_argument("--batch-size", type=int, default=REF_BATCH_SIZE)
-    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--epochs", type=int, default=700)
     ap.add_argument("--n-slices", type=int, default=128,
                     help="M; keep FIXED between Step 0 and the ladder")
     ap.add_argument("--ref-width", type=int, default=REF_WIDTH)
     ap.add_argument("--ref-proj-dim", type=int, default=REF_PROJ_DIM)
     ap.add_argument("--ref-batch-size", type=int, default=REF_BATCH_SIZE)
     # --- data ---
-    ap.add_argument("--dataset", default="hibb/TESS-ZTF-isect",
+    ap.add_argument("--dataset", default="pc/ZTF-ATLAS-ASASSN-isect",
                     choices=sorted(INSTRUMENT_REGISTRY),
-                    help="HF dataset id (instrument layout from the registry)")
+                    help="dataset id (instrument layout from the registry): "
+                         "pc/<name> = local PC_matches DatasetDict under "
+                         "--data-root with its own train/validation/test "
+                         "split; hibb/<name> = private HF Hub repo")
+    ap.add_argument("--data-root", type=str, default=None,
+                    help=f"PC_matches directory for pc/ datasets (default "
+                         f"$PC_MATCHES_ROOT or {PC_ROOT})")
     ap.add_argument("--exclude-instrument", action="append", default=[],
                     help="drop this instrument entirely (repeatable), e.g. TESS")
+    ap.add_argument("--exclude-band", action="append", default=[],
+                    help="drop this band column (repeatable), e.g. i_ZTF "
+                         "(StarEmbed uses ZTF g + r only)")
     ap.add_argument("--no-transfer-probes", action="store_true",
                     help="skip the <A>_to_<B> cross-instrument transfer probes")
     ap.add_argument("--holdout-instrument", default=None,
@@ -1744,7 +2017,17 @@ def main():
                     help="repeat multi-instrument stars this many times in "
                          "the train epoch so cross-instrument pairs are not "
                          "drowned out by single-survey stars")
-    ap.add_argument("--val-frac", type=float, default=0.1)
+    add_wave_args(ap)
+    ap.add_argument("--split-file", type=str, default=None,
+                    help="(hibb/ datasets only; pc/ datasets use their own "
+                         "split column) gaia-id train/val/test split json from "
+                         "data/make_splits.py (default: data/splits/"
+                         "<dataset>_seed<split-seed>.json; 'none' = "
+                         "on-the-fly stratified split)")
+    ap.add_argument("--val-frac", type=float, default=0.1,
+                    help="only for the on-the-fly fallback split")
+    ap.add_argument("--test-frac", type=float, default=0.1,
+                    help="only for the on-the-fly fallback split")
     ap.add_argument("--split-seed", type=int, default=0)
     ap.add_argument("--hf-token", type=str, default=None,
                     help="overrides HF_TOKEN env var / cached `hf auth login`")
@@ -1837,13 +2120,24 @@ def main():
                     help="skip the online linear probe (pretraining only)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--num-workers", type=int, default=8)
-    args = ap.parse_args()
+    return ap
+
+
+def apply_args(args):
+    """Set the module-level layout/config globals from parsed ``args``."""
     if args.no_wandb:
         args.wandb = None
     configure_instruments(args.dataset, args.holdout_instrument,
-                          tuple(args.exclude_instrument))
+                          tuple(args.exclude_instrument), tuple(args.exclude_band))
+    configure_wave(args)
     global TRANSFER_PROBES, ADV_WEIGHT, ADV_RAMP, FAINT_MAG
+    global PREDICTOR_INST, PREDICTOR_HIDDEN
     TRANSFER_PROBES = not args.no_transfer_probes
+    PREDICTOR_INST = getattr(args, "predictor_instrument", None) or None
+    PREDICTOR_HIDDEN = getattr(args, "predictor_hidden", PREDICTOR_HIDDEN)
+    if PREDICTOR_INST is not None and PREDICTOR_INST not in TRAIN_INSTRUMENTS:
+        raise ValueError(f"--predictor-instrument {PREDICTOR_INST!r} not a "
+                         f"training instrument {TRAIN_INSTRUMENTS}")
     ADV_WEIGHT, ADV_RAMP = args.adv_weight, args.adv_ramp
     if args.asassn_faint_mag > 0 and "ASASSN" in INSTRUMENTS:
         FAINT_MAG = {"ASASSN": args.asassn_faint_mag}
@@ -1854,7 +2148,9 @@ def main():
         args.proj_dim = args.width
         args.ref_proj_dim = args.ref_width
 
-    cfg = ViewConfig(
+
+def make_view_config(args) -> ViewConfig:
+    return ViewConfig(
         window_days=args.window_days,
         window_days_max=args.window_days_max,
         min_window_obs=args.min_window_obs,
@@ -1881,6 +2177,11 @@ def main():
         norm=args.norm,
     )
 
+
+def main():
+    args = build_parser().parse_args()
+    apply_args(args)
+    cfg = make_view_config(args)
     records, label_to_idx = load_records(args)
     n_classes = len(label_to_idx)
 
