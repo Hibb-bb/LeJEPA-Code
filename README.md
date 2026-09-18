@@ -1288,7 +1288,7 @@ ghx4-interactive
 srun --account=bfrf-dtai-gh \
      --partition=ghx4-interactive \
      --gres=gpu:1 \
-     --cpus-per-task=8 \
-     --mem=32G \
+     --cpus-per-task=20 \
+     --mem=64G \
      --time=01:00:00 \
      --pty bash

@@ -330,7 +330,7 @@ def main():
     ap.add_argument("--lamb-ref", type=float, default=0.02,
                     help="additive lambda tuned at the REFERENCE rung; "
                          "rescaled here by the master rule")
-    ap.add_argument("--sweep-lamb", type=str, default=None,
+    ap.add_argument("--sweep-lamb", type=str, default='0.005,0.02,0.08,0.3',
                     help="comma-separated lambda grid, e.g. "
                          "'0.005,0.02,0.08,0.3'. Runs the Step-0 sweep AT "
                          "THIS config (raw additive lambdas, not rescaled) "
