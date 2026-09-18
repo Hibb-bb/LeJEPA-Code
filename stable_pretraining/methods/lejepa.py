@@ -153,6 +153,9 @@ class LeJEPAOutput(ModelOutput):
     :ivar projection: Detached projector outputs for monitoring:
         global-view projections flattened to [n_global*N, K] (train) or
         projected embeddings [N, K] (eval).
+    :ivar features: Optional *undetached* backbone features of all views,
+        view-major [n_views*N, D]. Set by LeJEPALightCurve in train mode
+        (None otherwise) for auxiliary losses on the embeddings.
     """
 
     loss: torch.Tensor = None
@@ -160,6 +163,7 @@ class LeJEPAOutput(ModelOutput):
     inv_loss: torch.Tensor = None
     sigreg_loss: torch.Tensor = None
     projection: torch.Tensor = None
+    features: torch.Tensor = None
 
 
 class LeJEPA(Module):

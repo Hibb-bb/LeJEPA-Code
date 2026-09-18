@@ -73,10 +73,15 @@ from .vit import (
 
 from .romae import (
     LSST_BAND_WAVELENGTHS,
+    ZTF_BAND_WAVELENGTHS,
+    TESS_ZTF_BAND_WAVELENGTHS,
     NDPRope,
     RoMAEForPreTraining,
     RoMAEForClassification,
+    RoMAELightCurveBackbone,
     Encoder as RoMAEEncoder,
+    BlockRope,
+    SimplexRope,
     tokenize_lightcurves,
 )
 
@@ -152,9 +157,14 @@ __all__ = [
     ViTImageDecoder,
     build_image_decoder,
     LSST_BAND_WAVELENGTHS,
+    ZTF_BAND_WAVELENGTHS,
+    TESS_ZTF_BAND_WAVELENGTHS,
     NDPRope,
     RoMAEForPreTraining,
     RoMAEForClassification,
+    RoMAELightCurveBackbone,
     RoMAEEncoder,
+    BlockRope,
+    SimplexRope,
     tokenize_lightcurves,
 ]

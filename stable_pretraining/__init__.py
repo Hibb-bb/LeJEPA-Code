@@ -27,7 +27,7 @@ import logging
 import os
 import sys
 
-os.environ["LOGURU_LEVEL"] = os.environ.get("LOGURU_LEVEL", "INFO")
+os.environ["LOGURU_LEVEL"] = os.environ.get("LOGURU_LEVEL", "ERROR")
 
 # Reduce the CUDA-allocator fragmentation that bites memory-hungry workloads
 # (e.g. ViT-L two-view at large batch). ``setdefault`` so users can override

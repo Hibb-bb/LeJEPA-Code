@@ -343,3 +343,77 @@ class NTXEntLoss(InfoNCELoss):
         mask[local_idx, offset + local_idx] = True
 
         return self._compute(anchors, candidates, targets, mask=mask)
+
+
+class MultiPositiveNTXEntLoss(InfoNCELoss):
+    """Multi-positive NT-Xent (``nt_xent_multi``): every other view of the
+    same instance is a positive.
+
+    For anchors ``z`` with instance ids ``ids``, the loss is the mean over
+    anchors of the mean, over their positives, of the negative log-softmax
+    over all other rows (temperature-scaled cosine similarities; the anchor's
+    own row is masked out). The SupCon "L_out" form
+    :cite:`khosla2020supervised`. With exactly two views per instance it
+    reduces to :class:`NTXEntLoss`.
+
+    Under DDP the candidates (and their ids) are gathered from all ranks the
+    way :class:`NTXEntLoss` does, so negatives span the global batch while
+    anchors stay local. Ids must be globally unique across ranks (e.g. a
+    dataset-level object index, not a batch row index) — duplicates of the
+    same object anywhere in the global batch are treated as positives, never
+    as false negatives.
+
+    Args:
+        temperature (float, optional): The temperature scaling factor.
+            Default is 0.2.
+    """
+
+    def __init__(self, temperature: float = 0.2):
+        super().__init__(temperature=temperature)
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        ids: torch.Tensor,
+        anchor_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the multi-positive NT-Xent loss.
+
+        Args:
+            z (torch.Tensor): Embeddings ``[M, D]`` of all views of the local
+                batch (any view order; e.g. ``[V*N, D]`` view-major).
+            ids (torch.Tensor): Instance id per row, ``[M]``; rows sharing an
+                id are positives of each other.
+            anchor_mask (torch.Tensor, optional): Boolean ``[M]``; rows set to
+                ``False`` are still candidates (positives / negatives of the
+                others) but are not anchors, i.e. contribute no loss term of
+                their own.
+
+        Returns:
+            torch.Tensor: Scalar loss. Anchors without any positive (an id
+            seen once in the global batch) contribute nothing.
+        """
+        anchors = F.normalize(z, dim=-1)
+        candidates = torch.cat(all_gather(anchors), dim=0)
+        cand_ids = torch.cat(all_gather(ids), dim=0)
+
+        m = anchors.size(0)
+        offset = get_rank() * m
+        device = z.device
+        local_idx = torch.arange(m, device=device)
+
+        sim = (anchors @ candidates.T) / self.temperature
+        self_mask = torch.zeros(m, candidates.size(0), dtype=torch.bool, device=device)
+        self_mask[local_idx, offset + local_idx] = True
+        sim = sim.masked_fill(self_mask, -torch.inf)
+
+        pos = (ids[:, None] == cand_ids[None, :]) & ~self_mask
+        log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+        n_pos = pos.sum(1)
+        has_pos = n_pos > 0
+        if anchor_mask is not None:
+            has_pos = has_pos & anchor_mask.to(device)
+        per_anchor = (log_prob.masked_fill(~pos, 0.0)).sum(1) / n_pos.clamp(min=1)
+        if not bool(has_pos.any()):
+            return anchors.sum() * 0.0
+        return -per_anchor[has_pos].mean()

@@ -2,6 +2,7 @@ from .barlow_twins import BarlowTwins
 from .beit import BEiT
 from .byol import BYOL
 from .cmae import CMAE
+from .contrastive_lightcurve import ContrastiveLightCurve
 from .cross_mae import CrossMAE
 from .data2vec import Data2Vec
 from .dino import DINO
@@ -12,6 +13,7 @@ from .igpt import iGPT
 from .ijepa import IJEPA
 from .mae import MAE
 from .lejepa import LeJEPA
+from .lejepa_lightcurve import LeJEPALightCurve
 from .maskfeat import MaskFeat
 from .mim_refiner import MIMRefiner
 from .mocov2 import MoCov2
@@ -37,6 +39,7 @@ __all__ = [
     "BEiT",
     "BYOL",
     "CMAE",
+    "ContrastiveLightCurve",
     "CrossMAE",
     "Data2Vec",
     "DINO",
@@ -47,6 +50,7 @@ __all__ = [
     "IJEPA",
     "MAE",
     "LeJEPA",
+    "LeJEPALightCurve",
     "MaskFeat",
     "MIMRefiner",
     "MoCov2",

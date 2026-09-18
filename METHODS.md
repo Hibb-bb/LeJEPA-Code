@@ -26,6 +26,7 @@ Methods come in two forms:
 | DINOv2 | `dinov2` | `DINOv2` | `DINOv2Loss`, `iBOTPatchLoss` | `TeacherStudent†` | [Oquab et al., 2024](https://arxiv.org/abs/2304.07193) |
 | BEiT | — | `BEiT` | — | — | [Bao et al., 2022](https://arxiv.org/abs/2106.08254) |
 | CMAE | — | `CMAE` | — | — | [Huang et al., 2023](https://arxiv.org/abs/2207.13532) |
+| Contrastive (light curves) | — | `ContrastiveLightCurve` | `MultiPositiveNTXEntLoss` | `RoMAELightCurveBackbone` | [Khosla et al., 2020](https://arxiv.org/abs/2004.11362) |
 | CrossMAE | — | `CrossMAE` | — | — | [Fu et al., 2025](https://arxiv.org/abs/2401.14391) |
 | Data2Vec | — | `Data2Vec` | — | `TeacherStudent†` | [Baevski et al., 2022](https://arxiv.org/abs/2202.03555) |
 | DINOv3 | — | `DINOv3` | `DINOv2Loss` | `TeacherStudent†` | [Siméoni et al., 2025](https://arxiv.org/abs/2309.16588) |
@@ -33,6 +34,7 @@ Methods come in two forms:
 | iGPT | — | `iGPT` | — | — | [El-Nouby et al., 2024](https://arxiv.org/abs/2401.08541) |
 | IJEPA | — | `IJEPA` | — | — | [Assran et al., 2023](https://arxiv.org/abs/2301.08243) |
 | LeJEPA | — | `LeJEPA` | — | — | [Balestriero & LeCun, 2025](https://arxiv.org/abs/2511.08544) |
+| LeJEPA (light curves) | — | `LeJEPALightCurve` | — | `RoMAELightCurveBackbone` | [Balestriero & LeCun, 2025](https://arxiv.org/abs/2511.08544) |
 | MAE | — | `MAE` | `MAELoss` | — | [He et al., 2022](https://arxiv.org/abs/2111.06377) |
 | MaskFeat | — | `MaskFeat` | — | — | [Wei et al., 2022](https://arxiv.org/abs/2112.09133) |
 | MIMRefiner | — | `MIMRefiner` | `DINOv1Loss`, `iBOTPatchLoss` | — | [Lehner et al., 2024](https://arxiv.org/abs/2402.10093) |

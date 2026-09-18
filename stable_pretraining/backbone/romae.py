@@ -1,11 +1,4 @@
-"""RoMAE backbone: Rotary Masked Autoencoder for irregular continuous-position data.
-
-Ported from https://github.com/Chromeilion/RoMAE (MIT License, Uros Zivanovic)
-— "Rotary Masked Autoencoders are Versatile Learners", arXiv:2505.20535
-(NeurIPS 2025).
-
-Porting changes relative to upstream:
-
+"""
 - All pydantic / pydantic-settings config classes (``EncoderConfig``,
   ``RoMAEBaseConfig``, ``RoMAEForClassificationConfig``,
   ``RoMAEForPreTrainingConfig``) are replaced by plain constructor keyword
@@ -396,6 +389,158 @@ class NDPRope(nn.Module):
         return x
 
 
+def simplex_directions(n: int) -> torch.Tensor:
+    """Unit vectors from the centroid to the ``n + 1`` vertices of a regular
+    simplex in ``R^n`` (``[[1.0]]`` for ``n == 1``), as in nD-RoPE."""
+    if n == 1:
+        return torch.tensor([[1.0]])
+    pts = torch.eye(n + 1)
+    pts = pts - pts.mean(dim=0, keepdim=True)
+    u, _, _ = torch.linalg.svd(pts.T, full_matrices=False)
+    red = pts @ u[:, :-1]  # (n+1, n)
+    return red / red.norm(dim=1, keepdim=True)
+
+
+class SimplexRope(nn.Module):
+    """nD-RoPE (Li et al. 2026, arXiv:2606.12146) over a group of position axes.
+
+    Instead of one axis per channel block (axial RoPE), every rotation angle
+    is the inner product ``omega^T x`` between the *whole* ``n``-dimensional
+    position vector of the group and a wave vector ``omega``. The wave
+    vectors are the ``M = n + 1`` centroid-to-vertex directions of a regular
+    simplex (isotropic, full-rank coverage), replicated over ``S`` geometric
+    scales ``theta^(-s/S)``, so the block has ``dim = 2 * M * S`` channels.
+    Each head optionally gets its own random rotation of the simplex
+    (``rotate=True``, as in the reference implementation), drawn once at
+    construction from ``seed``.
+
+    ``p`` mirrors p-RoPE: only the ``round(p * S)`` highest-frequency scales
+    rotate, the remaining scales get magnitude 0 (NoPE channels).
+
+    Args:
+        dim: Channels of this block (must be a multiple of ``2 * (n + 1)``).
+        n_axes: Number of position axes in the group.
+        nhead: Number of attention heads (for per-head rotations).
+        theta: Base of the geometric scale ladder.
+        p: Fraction of scales that rotate.
+        rotate: Random per-head rotation of the simplex.
+        seed: RNG seed for the rotations.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        n_axes: int,
+        nhead: int,
+        theta: float = 100.0,
+        p: float = 1.0,
+        rotate: bool = True,
+        seed: int = 0,
+    ):
+        super().__init__()
+        m = n_axes + 1 if n_axes > 1 else 1
+        if dim % (2 * m) != 0:
+            raise ValueError(
+                f"SimplexRope dim {dim} must be a multiple of 2*(n_axes+1)={2 * m}"
+            )
+        self.dim, self.n_axes, self.nhead, self.m = dim, n_axes, nhead, m
+        self.n_scales = dim // (2 * m)
+        base = simplex_directions(n_axes)  # (M, n)
+        g = torch.Generator().manual_seed(seed)
+        freqs = []
+        for _ in range(nhead):
+            if rotate and n_axes > 1:
+                q, _ = torch.linalg.qr(torch.randn(n_axes, n_axes, generator=g))
+                if torch.linalg.det(q) < 0:
+                    q[:, 0] = -q[:, 0]
+                freqs.append(base @ q.T)
+            else:
+                freqs.append(base)
+        self.register_buffer("freqs", torch.stack(freqs))  # (H, M, n)
+        s = torch.arange(self.n_scales, dtype=torch.float32)
+        mag = theta ** (-s / max(self.n_scales, 1))
+        n_active = int(round(p * self.n_scales))
+        mag[n_active:] = 0.0
+        self.register_buffer("mag", mag)  # (S,)
+        self.cache: Optional[tuple] = None
+
+    def reset_cache(self) -> None:
+        self.cache = None
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Rotate ``x [B, N, H, dim]`` by ``positions [B, n_axes, N]``."""
+        b, n, h, d = x.shape
+        if self.cache is None:
+            pos = positions.transpose(1, 2).float()  # (B, N, n)
+            proj = torch.einsum("bnd,hmd->bnhm", pos, self.freqs)  # (B,N,H,M)
+            ang = proj[..., None] * self.mag  # (B,N,H,M,S)
+            ang = ang.reshape(b, n, h, self.m * self.n_scales)
+            self.cache = (torch.sin(ang), torch.cos(ang))
+        sin, cos = self.cache
+        first, second = torch.tensor_split(x, 2, dim=-1)
+        out = torch.cat(
+            [first * cos - second * sin, second * cos + first * sin], dim=-1
+        )
+        return out.to(x.dtype)
+
+
+class BlockRope(nn.Module):
+    """Rotary encoding with an explicit head-dimension layout.
+
+    The head dimension is cut into contiguous channel blocks, each rotated
+    by its own subset of the position axes and its own scheme:
+
+    - ``kind="axial"`` — one axis, standard (p-)RoPE on that slice
+      (:class:`NDPRope` with ``n_dims=1``). Several axial blocks of unequal
+      width are allowed, which :class:`NDPRope` alone (equal split) is not.
+    - ``kind="simplex"`` — a group of axes encoded jointly with
+      :class:`SimplexRope` (nD-RoPE).
+
+    ``blocks`` is a list of dicts ``{"kind", "axes", "dim", ...}`` whose
+    ``dim`` values sum to ``head_dim``; extra keys are passed to the block
+    constructor (``p``, ``base``, ``theta``, ``rotate``, ``seed``). Example
+    for ``(time, l10, l50, l90)`` positions at ``head_dim=60``::
+
+        [{"kind": "axial", "axes": [0], "dim": 36, "p": 0.75},
+         {"kind": "simplex", "axes": [1, 2, 3], "dim": 24, "p": 0.75}]
+    """
+
+    def __init__(self, head_dim: int, nhead: int, blocks: list[dict]):
+        super().__init__()
+        self.head_dim = head_dim
+        self.axes, self.dims, mods = [], [], []
+        for spec in blocks:
+            spec = dict(spec)
+            kind, axes, dim = spec.pop("kind"), list(spec.pop("axes")), spec.pop("dim")
+            if kind == "axial":
+                if len(axes) != 1:
+                    raise ValueError("axial block takes exactly one axis")
+                mods.append(NDPRope(head_dim=dim, n_dims=1, **spec))
+            elif kind == "simplex":
+                mods.append(SimplexRope(dim, len(axes), nhead, **spec))
+            else:
+                raise ValueError(f"unknown rope block kind {kind!r}")
+            self.axes.append(axes)
+            self.dims.append(dim)
+        if sum(self.dims) != head_dim:
+            raise ValueError(
+                f"rope block dims {self.dims} must sum to head_dim={head_dim}"
+            )
+        self.blocks = nn.ModuleList(mods)
+
+    def reset_cache(self) -> None:
+        for m in self.blocks:
+            m.reset_cache()
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """``x [B, N, H, head_dim]``, ``positions [B, n_pos_dims, N]``."""
+        outs, lo = [], 0
+        for mod, axes, dim in zip(self.blocks, self.axes, self.dims):
+            outs.append(mod(x[..., lo:lo + dim], positions[:, axes]))
+            lo += dim
+        return torch.cat(outs, dim=-1)
+
+
 def _get_inpt_pos_embedding(pos_encoding: str, d_model: int, max_len: int) -> nn.Module:
     """Return the positional encoding applied at the input, per config."""
     if pos_encoding == "absolute":
@@ -404,10 +549,17 @@ def _get_inpt_pos_embedding(pos_encoding: str, d_model: int, max_len: int) -> nn
 
 
 def _get_attn_pos_embedding(
-    pos_encoding: str, d_model: int, nhead: int, n_dims: int, p: float
+    pos_encoding: str,
+    d_model: int,
+    nhead: int,
+    n_dims: int,
+    p: float,
+    rope_blocks: Optional[list] = None,
 ) -> nn.Module:
     """Return the positional encoding applied at each attention block."""
     if pos_encoding == "ropend":
+        if rope_blocks is not None:
+            return BlockRope(d_model // nhead, nhead, rope_blocks)
         return NDPRope(n_dims=n_dims, head_dim=d_model // nhead, p=p)
     return DummyPosEmbedding()
 
@@ -452,6 +604,13 @@ class Attention(nn.Module):
         super().__init__()
         self.n_kv_heads = nhead
         self.head_dim = d_model // nhead
+        # Explicit logit scale, passed to F.scaled_dot_product_attention below.
+        # The default reproduces SDPA's standard 1/sqrt(head_dim); exposing it
+        # as a float attribute (alongside the int ``head_dim``) lets
+        # ``stable_pretraining.optim.apply_mup`` retune it to 1/head_dim for
+        # mu-P width transfer. SDPA honours an explicit ``scale`` even on its
+        # fused path, so no eager fallback is needed.
+        self.scale = self.head_dim**-0.5
         self.attn_dropout_val = attn_drop_rate
         self.proj_dropout = nn.Dropout(attn_proj_drop_rate)
         self.pos_dropout = nn.Dropout(pos_drop_rate)
@@ -488,6 +647,7 @@ class Attention(nn.Module):
             values,
             attn_mask=mask,
             dropout_p=self.attn_dropout_val if self.training else 0.0,
+            scale=self.scale,
         )
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.proj_dropout(self.wo(output))
@@ -733,6 +893,9 @@ class RoMAEBase(nn.Module):
         head_drop_rate: Dropout inside the prediction head.
         n_pos_dims: Number of positional axes (rows of ``positions``).
         p_rope_val: p-RoPE truncation fraction in [0, 1].
+        rope_blocks: Optional explicit head-dim layout (see
+            :class:`BlockRope`); ``None`` = equal axial split over
+            ``n_pos_dims`` axes (:class:`NDPRope`).
     """
 
     def __init__(
@@ -746,6 +909,7 @@ class RoMAEBase(nn.Module):
         head_drop_rate: float = 0.0,
         n_pos_dims: int = 3,
         p_rope_val: float = 0.75,
+        rope_blocks: Optional[list] = None,
         *args,
         **kwargs,
     ):
@@ -767,6 +931,7 @@ class RoMAEBase(nn.Module):
         self.head_drop_rate = head_drop_rate
         self.n_pos_dims = n_pos_dims
         self.p_rope_val = p_rope_val
+        self.rope_blocks = rope_blocks
 
         self.loss_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]
         self.loss_fn = None
@@ -819,6 +984,7 @@ class RoMAEBase(nn.Module):
             nhead=nhead,
             n_dims=self.n_pos_dims,
             p=self.p_rope_val,
+            rope_blocks=self.rope_blocks,
         )
         return inpt_pos_embedding, attn_pos_embedding
 
@@ -1123,6 +1289,97 @@ class RoMAEForClassification(RoMAEBase):
         return logits, loss
 
 
+class RoMAELightCurveBackbone(RoMAEBase):
+    """RoMAE encoder as a pooled feature extractor for JEPA-style SSL.
+
+    Wraps the shared :class:`RoMAEBase` machinery (tubelet projection, CLS
+    token, continuous n-D rotary encoding, transformer encoder) but returns a
+    single pooled embedding ``[B, d_model]`` instead of a task head — the shape
+    a method like :class:`~stable_pretraining.methods.LeJEPALightCurve`
+    expects from its backbone. It is the encoder-only, no-decoder counterpart
+    of :class:`RoMAEForClassification` (same forward up to the head).
+
+    The forward takes the ``(values, positions, pad_mask)`` triple emitted by
+    :func:`tokenize_lightcurves` and resets the rotary sin/cos cache after each
+    pass (bare ``Encoder`` use otherwise leaks positions across forwards).
+
+    Args:
+        encoder_kwargs: Encoder overrides merged over :data:`ENCODER_DEFAULTS`
+            (e.g. ``d_model``/``nhead``/``depth`` for a width ladder).
+        pool: ``"cls"`` returns the CLS token; ``"mean"`` returns the
+            masked mean over non-padding tokens (CLS excluded).
+        **base_kwargs: See :class:`RoMAEBase` (``tubelet_size``,
+            ``n_channels``, ``n_pos_dims``, ``p_rope_val``, ...). For
+            light-curve tokens use ``tubelet_size=(1, 1, 1)``, ``n_channels=1``
+            and ``n_pos_dims=2`` (time, wavelength).
+    """
+
+    def __init__(
+        self,
+        encoder_kwargs: Optional[dict] = None,
+        pool: str = "cls",
+        **base_kwargs,
+    ):
+        super().__init__(encoder_kwargs=encoder_kwargs, use_cls=True, **base_kwargs)
+        if pool not in ("cls", "mean"):
+            raise ValueError(f"pool must be 'cls' or 'mean', got {pool!r}")
+        self.pool = pool
+        self.inpt_pos_embedding, self.attn_pos_embedding = self.get_pos_embs(
+            nhead=self.encoder_kwargs["nhead"],
+            d_model=self.encoder_kwargs["d_model"],
+        )
+        # Exposed for downstream heads/probes/witnesses (parity with timm's
+        # ``backbone.embed_dim``).
+        self.embed_dim = self.encoder_kwargs["d_model"]
+        self.apply(_init_weights)
+
+    def reset_pos_cache(self) -> None:
+        """Clear the rotary sin/cos caches (called after every forward)."""
+        self.inpt_pos_embedding.reset_cache()
+        self.attn_pos_embedding.reset_cache()
+
+    def forward(
+        self,
+        values: torch.Tensor,
+        positions: torch.Tensor,
+        pad_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Encode a batch of tokenized light curves to pooled embeddings.
+
+        Args:
+            values: BTCHW tubelet input ``[B, N, 1, 1, 1]``.
+            positions: Continuous positions ``[B, n_pos_dims, N]``.
+            pad_mask: Optional bool ``[B, N]``; True marks padding tokens.
+
+        Returns:
+            Pooled embeddings ``[B, d_model]``.
+        """
+        x = patchify(self.tubelet_size, values)
+        x = self.projection(x)
+        x, positions, pad_mask = self.add_cls(x, positions, pad_mask)
+        attn_mask = _get_attn_mask(x.shape, x.device, pad_mask)
+        x = self.inpt_pos_embedding(x, positions)
+        x = self.encoder(
+            x,
+            positions=positions,
+            pos_encoding=self.attn_pos_embedding,
+            attn_mask=attn_mask,
+        )
+        if self.pool == "cls":
+            out = x[:, 0, :]
+        else:
+            # Masked mean over the real (non-CLS, non-padding) tokens.
+            tokens = x[:, 1:, :]
+            if pad_mask is not None:
+                real = ~pad_mask[:, 1:]
+                denom = real.sum(dim=1, keepdim=True).clamp(min=1)
+                out = (tokens * real[..., None]).sum(dim=1) / denom
+            else:
+                out = tokens.mean(dim=1)
+        self.reset_pos_cache()
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Asynchronous multivariate time-series tokenization
 # ---------------------------------------------------------------------------
@@ -1134,6 +1391,14 @@ LSST_BAND_WAVELENGTHS = {0: 368.0, 1: 480.0, 2: 622.0, 3: 754.0, 4: 869.0, 5: 97
 #: ZTF g/r/i effective wavelengths (nm).
 ZTF_BAND_WAVELENGTHS = {0: 472.0, 1: 634.0, 2: 789.0}
 
+#: Effective wavelengths (nm) for the ``hibb/TESS-ZTF-isect`` band layout:
+#: 0 = TESS (broad red optical, ~786 nm pivot), 1/2/3 = ZTF g/r/i. Pass this as
+#: the ``band_wavelengths`` argument of :func:`tokenize_lightcurves` so the
+#: wavelength position axis is shared and consistent across single-instrument
+#: views (TESS-only vs ZTF-only), which is what makes cross-instrument LeJEPA
+#: views comparable on the same rotary axis.
+TESS_ZTF_BAND_WAVELENGTHS = {0: 786.0, 1: 472.0, 2: 634.0, 3: 789.0}
+
 
 def tokenize_lightcurves(
     times: list,
@@ -1144,6 +1409,8 @@ def tokenize_lightcurves(
     wavelength_scale: float = 1.0,
     ref_wavelength: Optional[float] = None,
     cls_offset: bool = True,
+    band_positions: Optional[dict] = None,
+    band_features: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Tokenize asynchronous multiband light curves for RoMAE.
 
@@ -1187,13 +1454,24 @@ def tokenize_lightcurves(
         cls_offset: Shift all positions by +1 so the CLS token alone owns
             position 0 (mirroring :func:`prepare_positions`); padding
             positions stay 0.
+        band_positions: Mapping band id -> sequence of ``k`` extra position
+            coordinates (already in final units, e.g. log-wavelength
+            percentiles). When given it *replaces* the ``band_wavelengths``
+            axis: positions become ``[time, *coords]`` (``k`` may be 0 for
+            a time-only encoding).
+        band_features: Mapping band id -> sequence of ``F`` per-band
+            content features appended to the value channel, so values
+            become ``[B, N, 1 + F, 1, 1]`` (the tubelet projection then
+            adds a linear embedding of the filter descriptor to each
+            token). Padding tokens get zeros.
 
     Returns:
-        Tuple of ``values [B, N_max, 1, 1, 1]`` (BTCHW layout for
-        ``(1, 1, 1)`` tubelets), ``positions [B, 2, N_max]`` in the model's
-        ``[B, n_pos_dims, N]`` layout with axis 0 = time and axis 1 =
-        wavelength (or band index), and boolean ``pad_mask [B, N_max]``
-        (True where padded). Tokens are sorted by time within each object.
+        Tuple of ``values [B, N_max, C, 1, 1]`` (BTCHW layout for
+        ``(1, 1, 1)`` tubelets; ``C = 1 + F``), ``positions
+        [B, n_pos_dims, N_max]`` with axis 0 = time and the remaining axes
+        = wavelength (or band index, or ``band_positions``), and boolean
+        ``pad_mask [B, N_max]`` (True where padded). Tokens are sorted by
+        time within each object.
     """
     if not (len(times) == len(values) == len(bands)):
         raise ValueError(
@@ -1213,9 +1491,34 @@ def tokenize_lightcurves(
             lams = torch.tensor([float(v) for v in band_wavelengths.values()])
             ref_wavelength = float(lams.log().mean().exp())  # geometric mean
 
-    out_values = torch.zeros(n_objects, n_max)
+    def _lut(table, what):
+        size = int(max(table)) + 1 if table else 0
+        width = len(next(iter(table.values()))) if table else 0
+        lut = torch.full((size, width), float("nan"))
+        for k, row in table.items():
+            if len(row) != width:
+                raise ValueError(f"{what}: band {k} has {len(row)} entries, expected {width}")
+            lut[int(k)] = torch.tensor([float(x) for x in row])
+        return lut
+
+    def _lookup(lut, b, i, what):
+        bad = b >= lut.shape[0]
+        rows = lut[b.clamp(max=max(lut.shape[0] - 1, 0))]
+        bad = bad | torch.isnan(rows).any(dim=-1)
+        if bad.any():
+            raise KeyError(
+                f"object {i}: band ids {sorted(set(b[bad].tolist()))} missing from {what}"
+            )
+        return rows
+
+    pos_lut = _lut(band_positions, "band_positions") if band_positions is not None else None
+    feat_lut = _lut(band_features, "band_features") if band_features is not None else None
+    n_extra = pos_lut.shape[1] if pos_lut is not None else 1
+    n_feat = feat_lut.shape[1] if feat_lut is not None else 0
+
+    out_values = torch.zeros(n_objects, n_max, 1 + n_feat)
     out_time = torch.zeros(n_objects, n_max)
-    out_wave = torch.zeros(n_objects, n_max)
+    out_wave = torch.zeros(n_objects, n_extra, n_max)
     pad_mask = torch.ones(n_objects, n_max, dtype=torch.bool)
 
     for i, (t, v, b) in enumerate(zip(times, values, bands)):
@@ -1227,7 +1530,9 @@ def tokenize_lightcurves(
         n = t.numel()
         order = torch.argsort(t.float())
         t, v, b = t.float()[order], v.float()[order], b.long()[order]
-        if band_wavelengths is not None:
+        if pos_lut is not None:
+            wave = _lookup(pos_lut, b, i, "band_positions").T  # (k, n)
+        elif band_wavelengths is not None:
             out_of_range = b >= lut.numel()
             in_range_lam = lut[b.clamp(max=lut.numel() - 1)]
             bad = out_of_range | torch.isnan(in_range_lam)
@@ -1241,14 +1546,16 @@ def tokenize_lightcurves(
             wave = torch.log(lam / ref_wavelength) / wavelength_scale
         else:
             wave = b.float()
-        out_values[i, :n] = v
+        out_values[i, :n, 0] = v
+        if feat_lut is not None:
+            out_values[i, :n, 1:] = _lookup(feat_lut, b, i, "band_features")
         out_time[i, :n] = t / time_scale
-        out_wave[i, :n] = wave
+        out_wave[i, :, :n] = wave
         pad_mask[i, :n] = False
 
     if cls_offset:
         out_time = out_time + 1.0
         out_wave = out_wave + 1.0
-    positions = torch.stack([out_time, out_wave], dim=1)
+    positions = torch.cat([out_time[:, None, :], out_wave], dim=1)
     positions = positions * (~pad_mask)[:, None, :]
-    return out_values[:, :, None, None, None], positions, pad_mask
+    return out_values[:, :, :, None, None], positions, pad_mask

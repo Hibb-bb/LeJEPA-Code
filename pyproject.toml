@@ -91,6 +91,13 @@ swanlab = ["swanlab>=0.8.0"]
 # DeepSpeed ZeRO sharding (partial: single-optimizer methods only; FSDP2 is the
 # preferred sharding path and needs no extra dep). Strategy: "deepspeed_stage_3".
 deepspeed = ["deepspeed"]
+# Handcrafted-feature baseline of benchmarks/lightcurves (StarEmbed feature
+# set): the Rust ``light_curve`` extractor and the Python-3 fork of FATS.
+# Install with ``pip install -e ".[lightcurves]"`` (or ``uv pip install``).
+lightcurves = [
+    "light-curve",
+    "FATS @ git+https://github.com/nabeelre/FATS.git",
+]
 # Development and documentation tools
 dev = [
     "pytest",
