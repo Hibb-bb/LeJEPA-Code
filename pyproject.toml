@@ -97,6 +97,11 @@ deepspeed = ["deepspeed"]
 lightcurves = [
     "light-curve",
     "FATS @ git+https://github.com/nabeelre/FATS.git",
+    # pretrain.py's extinction augmentation (--p-extinction).
+    "extinction",
+    # HardwareMonitor's CPU/RAM and GPU metrics (it warns and skips without).
+    "psutil",
+    "nvidia-ml-py",
 ]
 # Development and documentation tools
 dev = [

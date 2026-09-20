@@ -41,6 +41,7 @@ def resolve_hf_token(explicit=None):
     return get_token()
 
 import lightning as pl
+from lightning.pytorch.callbacks import ModelCheckpoint
 import numpy as np
 import torch
 import torch.nn as nn
@@ -1815,6 +1816,33 @@ class InstrumentEmbeddingEval(pl.Callback):
         plt.close(fig)
 
 
+def resolve_resume(args):
+    """Checkpoint path for ``--resume``, or ``None`` to start fresh.
+
+    ``auto`` looks for ``last.ckpt`` in the directory Lightning writes this
+    run's checkpoints to under WandbLogger (``RUNS_DIR/<project>/<run id>``),
+    so a resubmitted SLURM job with the same ``WANDB_RUN_ID`` picks up where
+    the previous one stopped, and the first submission starts fresh.
+    """
+    if not args.resume:
+        return None
+    if args.resume != "auto":
+        if not Path(args.resume).exists():
+            raise FileNotFoundError(f"--resume {args.resume} does not exist")
+        return args.resume
+    run_id = os.environ.get("WANDB_RUN_ID")
+    if not (args.wandb and run_id):
+        raise ValueError("--resume auto needs wandb on and WANDB_RUN_ID set "
+                         "(it locates runs/<project>/<run id>/checkpoints); "
+                         "pass an explicit checkpoint path otherwise")
+    last = RUNS_DIR / args.wandb / run_id / "checkpoints" / "last.ckpt"
+    if last.exists():
+        logger.warning(f"resuming from {last}")
+        return str(last)
+    logger.warning(f"--resume auto: no {last} yet, starting fresh")
+    return None
+
+
 def train_once(args, lamb, records, n_classes, cfg, sweep_mode=False,
                idx_to_label=None):
     """Build everything fresh and train one run at the given lambda.
@@ -1918,9 +1946,28 @@ def train_once(args, lamb, records, n_classes, cfg, sweep_mode=False,
                  + ("-idproj" if args.projector == "identity" else "")
                  + (f"-pred{PREDICTOR_INST}" if PREDICTOR_INST else ""),
             config={**vars(args), "lamb": lamb, "sweep_mode": sweep_mode},
+            # Continue the same wandb run when a job is resubmitted with
+            # the same WANDB_RUN_ID (--resume auto).
+            resume="allow",
         )
     else:
         run_logger = not sweep_mode
+
+    # last.ckpt every epoch (the resume point; a wall-time kill loses at most
+    # one epoch) + a kept snapshot every --ckpt-every epochs. dirpath=None
+    # keeps Lightning's layout: runs/<project>/<run id>/checkpoints/.
+    # Lightning only writes last.ckpt in an epoch where it also saved a
+    # regular checkpoint, hence the rolling save_top_k=1 file next to it.
+    checkpoints = []
+    if not sweep_mode:
+        checkpoints.append(ModelCheckpoint(save_last=True, save_top_k=1,
+                                           every_n_epochs=1,
+                                           filename="rolling-{epoch}"))
+        # every_n_epochs is part of the callback's state key, so a second
+        # callback with every_n_epochs=1 would collide with the one above.
+        if args.ckpt_every > 1:
+            checkpoints.append(ModelCheckpoint(save_top_k=-1,
+                                               every_n_epochs=args.ckpt_every))
 
     trainer = pl.Trainer(
         default_root_dir=str(RUNS_DIR),
@@ -1936,10 +1983,12 @@ def train_once(args, lamb, records, n_classes, cfg, sweep_mode=False,
             *witnesses,
             # GPU util / memory, CPU, RAM as hardware/* metrics (any logger).
             spt.callbacks.HardwareMonitor(interval_seconds=10),
+            *checkpoints,
         ],
         precision=args.precision,
     )
-    trainer.fit(module, datamodule=data)
+    trainer.fit(module, datamodule=data,
+                ckpt_path=None if sweep_mode else resolve_resume(args))
     return witness_proj, witness_emb
 
 
@@ -2120,6 +2169,17 @@ def build_parser():
                     help="skip the online linear probe (pretraining only)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--num-workers", type=int, default=8)
+    # --- checkpointing / resume ---
+    ap.add_argument("--ckpt-every", type=int, default=100,
+                    help="also keep a snapshot every n epochs (epoch=<n-1>-*.ckpt, "
+                         "never overwritten; 0 or 1 = off). last.ckpt is refreshed "
+                         "every epoch regardless")
+    ap.add_argument("--resume", type=str, default=None,
+                    help="checkpoint to resume from (weights, optimizer, "
+                         "scheduler, epoch), or 'auto' = this run's last.ckpt "
+                         "(runs/<wandb project>/$WANDB_RUN_ID/checkpoints/), "
+                         "starting fresh if it does not exist yet. Keep "
+                         "--epochs identical: the LR schedule is built from it")
     return ap
 
 
